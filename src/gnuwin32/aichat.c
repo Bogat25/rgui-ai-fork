@@ -395,8 +395,9 @@ static const char AI_FALLBACK_PROMPT[] =
     "- Prefer base R and the packages the course already uses. Do not "
     "introduce a new package unless there is no reasonable base R way, "
     "and say so when you do.\n"
-    "- Put every piece of runnable code in a fenced block marked r so "
-    "it can be copied into the console.\n"
+    "- Put every piece of runnable code in a fenced block that starts "
+    "with ```r on its own line and ends with ``` on its own line, so the "
+    "Copy code button can find it.\n"
     "- Keep code short and commented, and explain what the output means "
     "in plain language.\n"
     "- When reference material is supplied below, follow its notation, "
@@ -898,6 +899,7 @@ static int ai_http(const char *method, const char *path,
 static HANDLE g_job      = NULL;
 static HANDLE g_srv_proc = NULL;
 static DWORD  g_srv_pid  = 0;
+static wchar_t g_srv_log[MAX_PATH] = L"";   /* llama-server's stdout+stderr */
 
 /* The warm-up thread started when the panel opens and the answer thread
    started by Send can both reach ai_server_start().  Without this lock
@@ -985,32 +987,87 @@ static int ai_server_start_locked(char *err, size_t errlen)
     char *slash = strrchr(workdir, '\\');
     if (slash) *slash = '\0'; else strcpy(workdir, ".");
 
-    STARTUPINFOW si;
+    STARTUPINFOEXW si;
     PROCESS_INFORMATION pi;
     memset(&si, 0, sizeof si);
-    si.cb = sizeof si;
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
+    si.StartupInfo.cb = sizeof si;
+    si.StartupInfo.dwFlags = STARTF_USESHOWWINDOW;
+    si.StartupInfo.wShowWindow = SW_HIDE;
     memset(&pi, 0, sizeof pi);
+
+    /* Keep the server's own output.  When it refuses to start -- an
+       option renamed in a newer llama.cpp, a missing DLL, a truncated
+       model -- the reason is in there, and ai_server_log_reason() puts
+       it in the status line instead of a bare "exited". */
+    HANDLE logh = INVALID_HANDLE_VALUE;
+    LPPROC_THREAD_ATTRIBUTE_LIST attrs = NULL;
+    BOOL inherit = FALSE;
+    {
+	wchar_t tmp[MAX_PATH];
+	DWORD n = GetTempPathW(MAX_PATH, tmp);
+	if (n > 0 && n < MAX_PATH - 32) {
+	    wcscat(tmp, L"rgui-llama-server.log");
+	    wcscpy(g_srv_log, tmp);
+	    SECURITY_ATTRIBUTES sa;
+	    sa.nLength = sizeof sa;
+	    sa.lpSecurityDescriptor = NULL;
+	    sa.bInheritHandle = TRUE;
+	    logh = CreateFileW(tmp, GENERIC_WRITE,
+			       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+			       &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+	}
+    }
+    if (logh != INVALID_HANDLE_VALUE) {
+	SIZE_T sz = 0;
+	InitializeProcThreadAttributeList(NULL, 1, 0, &sz);
+	attrs = (LPPROC_THREAD_ATTRIBUTE_LIST) malloc(sz);
+	if (attrs && InitializeProcThreadAttributeList(attrs, 1, 0, &sz)) {
+	    if (UpdateProcThreadAttribute(attrs, 0,
+					  PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+					  &logh, sizeof logh, NULL, NULL)) {
+		si.lpAttributeList = attrs;
+		si.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
+		si.StartupInfo.hStdInput  = NULL;
+		si.StartupInfo.hStdOutput = logh;
+		si.StartupInfo.hStdError  = logh;
+		inherit = TRUE;
+	    } else {
+		DeleteProcThreadAttributeList(attrs);
+		free(attrs);
+		attrs = NULL;
+	    }
+	} else {
+	    free(attrs);
+	    attrs = NULL;
+	}
+    }
+    DWORD cflags = CREATE_NO_WINDOW | CREATE_SUSPENDED |
+		   (attrs ? EXTENDED_STARTUPINFO_PRESENT : 0);
+    /* cb has to match the flag: the extended size only with the flag. */
+    si.StartupInfo.cb = attrs ? sizeof(STARTUPINFOEXW) : sizeof(STARTUPINFOW);
 
     wchar_t *wcmd = u8_to_wcs(cmd.s);
     wchar_t *wdir = u8_to_wcs(workdir);
     db_free(&cmd);
+    BOOL ok = FALSE;
+    if (wcmd && wdir) {
+	ok = CreateProcessW(NULL, wcmd, NULL, NULL, inherit,
+			    cflags | CREATE_BREAKAWAY_FROM_JOB,
+			    NULL, wdir, &si.StartupInfo, &pi);
+	if (!ok)
+	    ok = CreateProcessW(NULL, wcmd, NULL, NULL, inherit, cflags,
+				NULL, wdir, &si.StartupInfo, &pi);
+    }
+    DWORD lasterr = GetLastError();
+    if (attrs) { DeleteProcThreadAttributeList(attrs); free(attrs); }
+    if (logh != INVALID_HANDLE_VALUE) CloseHandle(logh);  /* child has its own */
     if (!wcmd || !wdir) {
 	free(wcmd); free(wdir);
 	snprintf(err, errlen, "Out of memory starting the model server.");
 	return 0;
     }
-
-    BOOL ok = CreateProcessW(NULL, wcmd, NULL, NULL, FALSE,
-			     CREATE_NO_WINDOW | CREATE_SUSPENDED |
-			     CREATE_BREAKAWAY_FROM_JOB,
-			     NULL, wdir, &si, &pi);
-    if (!ok)
-	ok = CreateProcessW(NULL, wcmd, NULL, NULL, FALSE,
-			    CREATE_NO_WINDOW | CREATE_SUSPENDED,
-			    NULL, wdir, &si, &pi);
     free(wcmd); free(wdir);
+    SetLastError(lasterr);
     if (!ok) {
 	snprintf(err, errlen,
 		 "Could not start the model server (Windows error %lu):\r\n  %s",
@@ -1032,6 +1089,52 @@ static int ai_server_start(char *err, size_t errlen)
     int ok = ai_server_start_locked(err, errlen);
     ai_srv_unlock();
     return ok;
+}
+
+/* The last line of llama-server's output that mentions an error, trimmed
+   to fit a status line.  Returns 1 if one was found. */
+static int ai_server_log_reason(char *out, size_t outlen)
+{
+    out[0] = '\0';
+    if (!g_srv_log[0]) return 0;
+    HANDLE h = CreateFileW(g_srv_log, GENERIC_READ,
+			   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+			   NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    char buf[16384];
+    DWORD got = 0;
+    LARGE_INTEGER size;
+    if (GetFileSizeEx(h, &size) && size.QuadPart > (LONGLONG) sizeof buf - 1) {
+	LARGE_INTEGER off;
+	off.QuadPart = size.QuadPart - (LONGLONG) (sizeof buf - 1);
+	SetFilePointerEx(h, off, NULL, FILE_BEGIN);
+    }
+    ReadFile(h, buf, (DWORD) sizeof buf - 1, &got, NULL);
+    CloseHandle(h);
+    buf[got] = '\0';
+
+    const char *best = NULL;
+    size_t bestlen = 0;
+    for (char *line = buf; *line; ) {
+	char *end = strchr(line, '\n');
+	size_t len = end ? (size_t) (end - line) : strlen(line);
+	for (size_t i = 0; i + 5 <= len; i++) {
+	    if (!strncasecmp(line + i, "error", 5) ||
+		(i + 6 <= len && !strncasecmp(line + i, "failed", 6))) {
+		best = line; bestlen = len;
+		break;
+	    }
+	}
+	if (!end) break;
+	line = end + 1;
+    }
+    if (!best) return 0;
+    while (bestlen && (best[bestlen-1] == '\r' || best[bestlen-1] == ' '))
+	bestlen--;
+    if (bestlen >= outlen) bestlen = outlen - 1;
+    memcpy(out, best, bestlen);
+    out[bestlen] = '\0';
+    return 1;
 }
 
 static void ai_server_stop(void)
@@ -1202,8 +1305,12 @@ static int w_wait_ready(void)
 	if (st == 200) return 1;
 	if (g_srv_proc &&
 	    WaitForSingleObject(g_srv_proc, 0) == WAIT_OBJECT_0) {
-	    w_status("The model server exited unexpectedly. "
-		     "Run it once from a command prompt to see why.");
+	    char why[300];
+	    if (ai_server_log_reason(why, sizeof why))
+		w_status("The model server stopped while starting: %s", why);
+	    else
+		w_status("The model server exited unexpectedly. "
+			 "Run it once from a command prompt to see why.");
 	    return 0;
 	}
 	if (!announced) {
@@ -1366,11 +1473,30 @@ static void edit_append_u8(HWND h, const char *u8)
     }
     LONG style = GetWindowLong(h, GWL_STYLE);
     int ro = (style & ES_READONLY) != 0;
+
+    /* EM_REPLACESEL inserts at the caret, so the caret has to be put at
+       the end first.  EM_SETSEL(-1, -1) does not do that -- it only
+       drops the selection and leaves the caret where the user last
+       clicked, which spliced streamed text into the middle of the
+       transcript.  An ANSI control reports its length in bytes, which
+       can only overshoot the end, and the control clamps that. */
+    DWORD sel0 = 0, sel1 = 0;
+    SendMessage(h, EM_GETSEL, (WPARAM) &sel0, (LPARAM) &sel1);
+    int user_selection = sel0 != sel1;
+    LRESULT end = IsWindowUnicode(h) ? GetWindowTextLengthW(h)
+				     : GetWindowTextLengthA(h);
+
     if (ro) SendMessage(h, EM_SETREADONLY, FALSE, 0);
-    SendMessage(h, EM_SETSEL, (WPARAM) -1, (LPARAM) -1);
+    SendMessage(h, EM_SETSEL, (WPARAM) end, (LPARAM) end);
     edit_send_text(h, EM_REPLACESEL, FALSE, t.s ? t.s : "");
     if (ro) SendMessage(h, EM_SETREADONLY, TRUE, 0);
-    SendMessage(h, EM_SCROLLCARET, 0, 0);
+
+    if (user_selection)
+	/* The user is selecting text, perhaps to copy it: leave that
+	   alone and do not scroll away from it. */
+	SendMessage(h, EM_SETSEL, (WPARAM) sel0, (LPARAM) sel1);
+    else
+	SendMessage(h, EM_SCROLLCARET, 0, 0);
     db_free(&t);
 }
 
