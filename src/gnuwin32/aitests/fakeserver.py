@@ -6,7 +6,7 @@ Exercises the parts of aichat.c that are easy to get wrong:
   - \\u escapes, including a surrogate pair
   - a role-only first delta whose "content" is null
 """
-import io, json, socket, sys, threading, time
+import hashlib, io, json, socket, sys, threading, time
 
 PORT = int(sys.argv[1])
 
@@ -46,6 +46,40 @@ EXPECTED = ("Use `t.test()`:\n\n```r\n"
             "unicode: éá and \U0001F600 done.")
 
 
+# A stand-in for the model file: 8 MB of deterministic bytes, served at
+# /file/<anything> with Range support.  "?slow" in the URL spreads it
+# over a few seconds, so Stop and "R stays usable" can be tested.
+DOWNLOAD = bytes((i * 31 + 7) & 0xFF for i in range(8_000_000))
+
+
+def serve_file(conn, head, target):
+    rng = None
+    for h in head.decode(errors="replace").split("\r\n")[1:]:
+        if h.lower().startswith("range:"):
+            rng = h.split(":", 1)[1].strip()
+    io.open("last_range.txt", "w").write(rng or "none")
+    start = 0
+    if rng and rng.startswith("bytes=") and rng.endswith("-"):
+        start = int(rng[6:-1])
+    if start >= len(DOWNLOAD):
+        conn.sendall(b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\n"
+                     b"Connection: close\r\n\r\n")
+        return
+    body = DOWNLOAD[start:]
+    status = b"206 Partial Content" if start else b"200 OK"
+    conn.sendall(b"HTTP/1.1 " + status + b"\r\nContent-Type: application/octet-stream"
+                 b"\r\nContent-Length: " + str(len(body)).encode() +
+                 b"\r\nConnection: close\r\n\r\n")
+    slow = "slow" in target
+    for i in range(0, len(body), 65536):
+        try:
+            conn.sendall(body[i:i + 65536])
+        except OSError:
+            return                      # the client went away (Stop)
+        if slow:
+            time.sleep(0.04)
+
+
 def sse_record(piece):
     if piece is None:
         delta = {"role": "assistant"}
@@ -77,6 +111,11 @@ def handle(conn):
         conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
                      b"Content-Length: " + str(len(body)).encode() +
                      b"\r\nConnection: close\r\n\r\n" + body)
+        conn.close()
+        return
+
+    if line0.startswith("GET /file/"):
+        serve_file(conn, head, line0.split(" ")[1])
         conn.close()
         return
 
@@ -142,5 +181,7 @@ if __name__ == "__main__":
     if "--expected" in sys.argv:
         text = replay_expected(REPLAY) if REPLAY else EXPECTED
         io.open("expected.txt","w",encoding="utf-8",newline="").write(text)
+        io.open("download.sha256", "w").write(hashlib.sha256(DOWNLOAD).hexdigest())
+        io.open("download.size", "w").write(str(len(DOWNLOAD)))
     else:
         main()

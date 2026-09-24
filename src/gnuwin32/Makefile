@@ -89,9 +89,11 @@ EXTRALIBS = getline/gl.a ../extra/xdr/libxdr.a \
    ../extra/intl/libintl.a ../extra/trio/libtrio.a ../extra/tzone/libtz.a \
    ../extra/tre/libtre.a
 
-## -lws2_32 is for aichat.c, which speaks HTTP to the local model server.
+## For aichat.c: ws2_32 for HTTP to the local model server, winhttp and
+## bcrypt for downloading the model on first use and checking its SHA-256.
 R-DLLLIBS = $(OPENMP) -L. $(FLIBS) -lRblas -L../../$(IMPDIR) -lRgraphapp \
   -lRiconv -lcomctl32 -lole32 -luuid -lwinmm -lversion -ldeflate -lws2_32 \
+  -lwinhttp -lbcrypt \
   $(LIBEXTRAS)
 
 

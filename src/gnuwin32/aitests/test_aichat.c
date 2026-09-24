@@ -233,6 +233,123 @@ static void test_cancel(int port)
 }
 
 
+/* ---- first-run model download against the fake server ------------- */
+
+static char *read_small(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    char b[256];
+    size_t n = fread(b, 1, sizeof b - 1, f);
+    fclose(f);
+    b[n] = '\0';
+    return xstrdup(b);
+}
+
+static void write_small(const char *path, const char *text)
+{
+    FILE *f = fopen(path, "wb");
+    if (f) { fputs(text, f); fclose(f); }
+}
+
+static long long file_len(const char *path)
+{
+    WIN32_FILE_ATTRIBUTE_DATA a;
+    if (!GetFileAttributesExA(path, GetFileExInfoStandard, &a)) return -1;
+    return ((long long) a.nFileSizeHigh << 32) | a.nFileSizeLow;
+}
+
+static void test_download(int port)
+{
+    char cwd[MAX_PATH], dest[MAX_PATH + 32], part[MAX_PATH + 40];
+    char url[128], slow[128], missing[128], err[512];
+    GetCurrentDirectoryA(MAX_PATH, cwd);
+    snprintf(dest, sizeof dest, "%s\\dl-test.gguf", cwd);
+    snprintf(part, sizeof part, "%s.part", dest);
+    snprintf(url, sizeof url, "http://127.0.0.1:%d/file/model.gguf", port);
+    snprintf(slow, sizeof slow, "http://127.0.0.1:%d/file/model.gguf?slow", port);
+    snprintf(missing, sizeof missing, "http://127.0.0.1:%d/nothing-here", port);
+
+    char *sha = read_small("download.sha256");
+    char *sz = read_small("download.size");
+    long long size = sz ? atoll(sz) : 0;
+    t_ok("download: fixture from the fake server", sha && size > 0);
+    if (!sha || size <= 0) { free(sha); free(sz); return; }
+
+    DeleteFileA(dest); DeleteFileA(part);
+    InterlockedExchange(&g_cancel, 0);
+    int ok = ai_download_file(url, dest, sha, size, err, sizeof err);
+    char *rng = read_small("last_range.txt");
+    t_ok("download: fresh file arrives complete", ok && file_len(dest) == size);
+    t_ok("download: .part renamed to the final name", file_len(part) < 0);
+    t_str("download: fresh request sends no Range", rng, "none");
+    free(rng);
+
+    /* Half a file left from an earlier attempt. */
+    {
+        FILE *in = fopen(dest, "rb"), *o = fopen(part, "wb");
+        char *b = (char *) malloc((size_t) (size / 2));
+        if (in && o && b) {
+            fread(b, 1, (size_t) (size / 2), in);
+            fwrite(b, 1, (size_t) (size / 2), o);
+        }
+        if (in) fclose(in);
+        if (o) fclose(o);
+        free(b);
+    }
+    DeleteFileA(dest);
+    ok = ai_download_file(url, dest, sha, size, err, sizeof err);
+    char want[64];
+    snprintf(want, sizeof want, "bytes=%lld-", size / 2);
+    rng = read_small("last_range.txt");
+    t_str("download: resume asks only for the rest", rng, want);
+    t_ok("download: resumed file complete and verified", ok && file_len(dest) == size);
+    free(rng);
+
+    DeleteFileA(dest);
+    ok = ai_download_file(url, dest,
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        size, err, sizeof err);
+    t_ok("download: checksum mismatch refused", !ok && file_len(dest) < 0);
+    t_ok("download: damaged file deleted", file_len(part) < 0);
+    t_ok("download: mismatch explained", strstr(err, "checksum") != NULL);
+
+    ok = ai_download_file(missing, dest, sha, size, err, sizeof err);
+    t_ok("download: HTTP error reported", !ok && strstr(err, "404"));
+
+    ok = ai_download_file("http://127.0.0.1:45999/file/x", dest, sha, size,
+                          err, sizeof err);
+    t_ok("download: unreachable server reported", !ok && strstr(err, "reach"));
+
+    /* Stop pauses; the next attempt carries on from the part file. */
+    unsigned tid;
+    HANDLE th = (HANDLE) _beginthreadex(NULL, 0, cancel_after,
+                                        (void *) (uintptr_t) 600, 0, &tid);
+    ok = ai_download_file(slow, dest, sha, size, err, sizeof err);
+    if (th) { WaitForSingleObject(th, 3000); CloseHandle(th); }
+    long long partial = file_len(part);
+    t_ok("download: Stop pauses it", !ok && strstr(err, "paused"));
+    t_ok("download: a paused download keeps its part",
+         partial > 0 && partial < size);
+    InterlockedExchange(&g_cancel, 0);
+    ok = ai_download_file(url, dest, sha, size, err, sizeof err);
+    t_ok("download: a paused download continues", ok && file_len(dest) == size);
+
+    /* All bytes arrived but the rename never happened (power cut). */
+    MoveFileExA(dest, part, MOVEFILE_REPLACE_EXISTING);
+    write_small("last_range.txt", "untouched");
+    ok = ai_download_file(url, dest, sha, size, err, sizeof err);
+    rng = read_small("last_range.txt");
+    t_ok("download: complete part is checked, not fetched again",
+         ok && rng && !strcmp(rng, "untouched") && file_len(dest) == size);
+    free(rng);
+
+    DeleteFileA(dest);
+    DeleteFileA(part);
+    free(sha);
+    free(sz);
+}
+
 /* ---- against the real model -------------------------------------- */
 
 /* Drives the production path end to end: ai_worker() finds no server,
@@ -260,6 +377,21 @@ static int test_real(const char *exe, const char *model, int port,
              "%s\\system_prompt.txt", ai);
     snprintf(CFG.context_dir, sizeof CFG.context_dir, "%s\\context", ai);
     printf("prompt  %s\ncontext %s\n", CFG.system_prompt_file, CFG.context_dir);
+
+    {
+        char tmp[MAX_PATH], dest[MAX_PATH + 32], err[512];
+        GetTempPathA(MAX_PATH, tmp);
+        snprintf(dest, sizeof dest, "%srgui-https-test.zip", tmp);
+        DeleteFileA(dest);
+        int ok = ai_download_file(
+            "https://github.com/ggml-org/llama.cpp/releases/download/b11153/"
+            "llama-b11153-bin-win-cpu-x64.zip", dest,
+            "569d19826f3fb00a3fc2df7bd68ab9ad33e5c0d6d69ce022b24372700cee7931",
+            18559858LL, err, sizeof err);
+        t_ok("real: HTTPS download, redirect, checksum", ok);
+        if (!ok) printf("      %s\n", err);
+        DeleteFileA(dest);
+    }
 
     conv_clear();
     DWORD t0 = GetTickCount();
@@ -334,6 +466,7 @@ int main(int argc, char **argv)
         test_awkward_question(port);
         test_cancel(port);
         test_no_server();
+        test_download(port);
     }
 
     printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "PASSED",

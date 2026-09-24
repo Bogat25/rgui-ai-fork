@@ -67,6 +67,12 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <process.h>
+#include <winhttp.h>
+#include <bcrypt.h>
+
+#ifndef WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY
+#define WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY 4
+#endif
 
 #include "graphapp/ga.h"
 #include "graphapp/graphapp.h"
@@ -228,6 +234,9 @@ typedef struct {
     char system_prompt_file[MAX_PATH];
     char context_dir[MAX_PATH];
     char extra_args[512];
+    char model_url[1024];   /* where to fetch the model on first use */
+    char model_sha256[72];  /* its published SHA-256, lower-case hex */
+    long long model_bytes;  /* its size, for the disk check and progress */
 } aiconf;
 
 static aiconf CFG;
@@ -302,7 +311,13 @@ static void ai_defaults(void)
     CFG.top_p             = 0.9;
     strcpy(CFG.host, "127.0.0.1");
     ai_resolve("ai/llama/llama-server.exe", CFG.server_exe, MAX_PATH);
-    ai_resolve("ai/models/qwen.gguf",       CFG.model,      MAX_PATH);
+    ai_resolve("ai/models/Qwen3.5-4B-Q4_K_M.gguf", CFG.model, MAX_PATH);
+    snprintf(CFG.model_url, sizeof CFG.model_url, "%s",
+	     "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/"
+	     "Qwen3.5-4B-Q4_K_M.gguf");
+    snprintf(CFG.model_sha256, sizeof CFG.model_sha256, "%s",
+	     "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4");
+    CFG.model_bytes = 2740937888LL;
     ai_resolve("ai/system_prompt.txt", CFG.system_prompt_file, MAX_PATH);
     ai_resolve("ai/context",           CFG.context_dir,        MAX_PATH);
 }
@@ -350,6 +365,12 @@ static void ai_load_config(void)
 	    strncpy(CFG.host, v, sizeof(CFG.host) - 1);
 	    CFG.host[sizeof(CFG.host) - 1] = '\0';
 	}
+	else if (!strcasecmp(k, "model_url"))
+	    snprintf(CFG.model_url, sizeof CFG.model_url, "%s", v);
+	else if (!strcasecmp(k, "model_sha256"))
+	    snprintf(CFG.model_sha256, sizeof CFG.model_sha256, "%s", v);
+	else if (!strcasecmp(k, "model_bytes"))
+	    CFG.model_bytes = strtoll(v, NULL, 10);
 	else if (!strcasecmp(k, "extra_args")) {
 	    strncpy(CFG.extra_args, v, sizeof(CFG.extra_args) - 1);
 	    CFG.extra_args[sizeof(CFG.extra_args) - 1] = '\0';
@@ -1228,6 +1249,7 @@ static char *ai_build_request(const char *question)
 #define WM_AI_DATA    (WM_USER + 21)   /* text waiting in g_pending      */
 #define WM_AI_STATUS  (WM_USER + 22)   /* lParam: malloc'd char*, we free */
 #define WM_AI_DONE    (WM_USER + 23)   /* wParam: 1 ok / 0 failed        */
+#define WM_AI_DLDONE  (WM_USER + 24)   /* model download ended, wParam ok */
 
 static HWND   g_msgwin = NULL;
 static dynbuf g_pending;                /* guarded by g_cs */
@@ -1433,6 +1455,293 @@ finish:
     return 0;
 }
 
+
+/* ------------------------------------------------------------------ */
+/* first-run model download                                            */
+/* ------------------------------------------------------------------ */
+
+/* The model is too big for the installer (and for a GitHub release
+   asset), so it is fetched the first time the assistant is used.
+   WinHTTP rather than raw sockets here: this goes to the internet over
+   TLS, and it honours the machine's proxy settings, which a school
+   network may require.  The file grows as <model>.part, so an
+   interrupted download continues where it stopped, and it only gets its
+   real name once its SHA-256 matches the published one. */
+
+static volatile LONG g_downloading = 0;
+
+static long long ai_file_size_w(const wchar_t *path)
+{
+    WIN32_FILE_ATTRIBUTE_DATA a;
+    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &a)) return -1;
+    return ((long long) a.nFileSizeHigh << 32) | a.nFileSizeLow;
+}
+
+/* SHA-256 of a file as 64 lower-case hex digits.  Honours g_cancel. */
+static int ai_sha256_file(const wchar_t *path, char out[65])
+{
+    int ok = 0;
+    BCRYPT_ALG_HANDLE alg = NULL;
+    BCRYPT_HASH_HANDLE hh = NULL;
+    unsigned char *buf = NULL;
+    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+			   OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    if (f == INVALID_HANDLE_VALUE) return 0;
+    buf = (unsigned char *) malloc(1 << 20);
+    if (buf &&
+	BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, NULL, 0) >= 0 &&
+	BCryptCreateHash(alg, &hh, NULL, 0, NULL, 0, 0) >= 0) {
+	DWORD got = 0;
+	ok = 1;
+	for (;;) {
+	    if (g_cancel) { ok = 0; break; }
+	    if (!ReadFile(f, buf, 1 << 20, &got, NULL)) { ok = 0; break; }
+	    if (got == 0) break;
+	    if (BCryptHashData(hh, buf, got, 0) < 0) { ok = 0; break; }
+	}
+	unsigned char dig[32];
+	if (ok && BCryptFinishHash(hh, dig, sizeof dig, 0) >= 0) {
+	    for (int i = 0; i < 32; i++)
+		snprintf(out + 2 * i, 3, "%02x", dig[i]);
+	} else
+	    ok = 0;
+    }
+    if (hh) BCryptDestroyHash(hh);
+    if (alg) BCryptCloseAlgorithmProvider(alg, 0);
+    free(buf);
+    CloseHandle(f);
+    return ok;
+}
+
+/* Fetch url into dest (UTF-8), resuming dest.part if it exists.  When
+   sha_hex is non-empty the result must match it.  expect is the size in
+   bytes, or 0 if unknown.  Returns 1 when dest is complete and checked;
+   otherwise 0 with a sentence for the status line in err.  Runs on a
+   worker thread: w_status only, no R API, no windows. */
+static int ai_download_file(const char *url, const char *dest,
+			    const char *sha_hex, long long expect,
+			    char *err, size_t errlen)
+{
+    int ok = 0;
+    wchar_t *wurl = u8_to_wcs(url), *wdest = u8_to_wcs(dest);
+    wchar_t *wpart = NULL, *host = NULL;
+    HINTERNET ses = NULL, con = NULL, req = NULL;
+    HANDLE out = INVALID_HANDLE_VALUE;
+    unsigned char *buf = NULL;
+    long long have = 0, total = expect;
+    DWORD status = 0;
+    const double GB = 1e9;
+
+    err[0] = '\0';
+    if (!wurl || !wdest) { snprintf(err, errlen, "Out of memory."); goto done; }
+    wpart = (wchar_t *) malloc((wcslen(wdest) + 6) * sizeof(wchar_t));
+    if (!wpart) { snprintf(err, errlen, "Out of memory."); goto done; }
+    wcscpy(wpart, wdest);
+    wcscat(wpart, L".part");
+
+    have = ai_file_size_w(wpart);
+    if (have < 0) have = 0;
+    if (expect > 0 && have > expect) { DeleteFileW(wpart); have = 0; }
+
+    if (!(expect > 0 && have == expect)) {
+	/* Room for what is still to come, plus a margin. */
+	wchar_t dir[MAX_PATH];
+	wcsncpy(dir, wdest, MAX_PATH - 1);
+	dir[MAX_PATH - 1] = L'\0';
+	wchar_t *sl = wcsrchr(dir, L'\\');
+	if (sl) *sl = L'\0';
+	ULARGE_INTEGER freeb;
+	if (expect > 0 && GetDiskFreeSpaceExW(dir, &freeb, NULL, NULL) &&
+	    (long long) freeb.QuadPart < expect - have + (64LL << 20)) {
+	    snprintf(err, errlen,
+		     "Not enough free space for the AI model: it needs %.1f GB "
+		     "more, the drive has %.1f GB free.",
+		     (expect - have) / GB, (double) freeb.QuadPart / GB);
+	    goto done;
+	}
+
+	URL_COMPONENTS uc;
+	memset(&uc, 0, sizeof uc);
+	uc.dwStructSize = sizeof uc;
+	uc.dwSchemeLength = (DWORD) -1;
+	uc.dwHostNameLength = (DWORD) -1;
+	uc.dwUrlPathLength = (DWORD) -1;
+	uc.dwExtraInfoLength = (DWORD) -1;
+	if (!WinHttpCrackUrl(wurl, 0, 0, &uc) || !uc.dwHostNameLength) {
+	    snprintf(err, errlen, "model_url in Rai.conf is not a valid URL.");
+	    goto done;
+	}
+	host = (wchar_t *) malloc((uc.dwHostNameLength + 1) * sizeof(wchar_t));
+	if (!host) { snprintf(err, errlen, "Out of memory."); goto done; }
+	wcsncpy(host, uc.lpszHostName, uc.dwHostNameLength);
+	host[uc.dwHostNameLength] = L'\0';
+
+	ses = WinHttpOpen(L"RGui-AI/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+			  WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+	if (!ses)
+	    ses = WinHttpOpen(L"RGui-AI/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+			      WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+	if (ses) WinHttpSetTimeouts(ses, 30000, 30000, 30000, 60000);
+	if (ses) con = WinHttpConnect(ses, host, uc.nPort, 0);
+	/* lpszUrlPath runs on to the end of the URL, query included. */
+	if (con)
+	    req = WinHttpOpenRequest(con, L"GET", uc.lpszUrlPath, NULL,
+				     WINHTTP_NO_REFERER,
+				     WINHTTP_DEFAULT_ACCEPT_TYPES,
+				     uc.nScheme == INTERNET_SCHEME_HTTPS ?
+				     WINHTTP_FLAG_SECURE : 0);
+	if (!req) {
+	    snprintf(err, errlen, "Could not prepare the download (Windows error %lu).",
+		     (unsigned long) GetLastError());
+	    goto done;
+	}
+	if (have > 0) {
+	    char range[64];
+	    snprintf(range, sizeof range, "Range: bytes=%lld-", have);
+	    wchar_t *wr = u8_to_wcs(range);
+	    if (wr) {
+		WinHttpAddRequestHeaders(req, wr, (DWORD) -1, WINHTTP_ADDREQ_FLAG_ADD);
+		free(wr);
+	    }
+	}
+	if (!WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+				WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+	    !WinHttpReceiveResponse(req, NULL)) {
+	    snprintf(err, errlen,
+		     "Could not reach the download server (Windows error %lu). "
+		     "Check the internet connection and open the assistant again.",
+		     (unsigned long) GetLastError());
+	    goto done;
+	}
+	DWORD sl2 = sizeof status;
+	WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+			    WINHTTP_HEADER_NAME_BY_INDEX, &status, &sl2,
+			    WINHTTP_NO_HEADER_INDEX);
+	if (status == 200)
+	    have = 0;                    /* no resume on offer: start over */
+	else if (status == 416) {
+	    DeleteFileW(wpart);          /* our partial file makes no sense */
+	    snprintf(err, errlen, "The download could not be resumed and was "
+		     "reset. Open the assistant again to start it afresh.");
+	    goto done;
+	} else if (status != 206) {
+	    snprintf(err, errlen, "The download server answered HTTP %lu.",
+		     (unsigned long) status);
+	    goto done;
+	}
+	wchar_t cl[32];
+	DWORD cls = sizeof cl;
+	if (WinHttpQueryHeaders(req, WINHTTP_QUERY_CONTENT_LENGTH,
+				WINHTTP_HEADER_NAME_BY_INDEX, cl, &cls,
+				WINHTTP_NO_HEADER_INDEX)) {
+	    long long n = _wcstoi64(cl, NULL, 10);
+	    if (n > 0) total = have + n;
+	}
+
+	out = CreateFileW(wpart, GENERIC_WRITE, FILE_SHARE_READ, NULL,
+			  OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (out == INVALID_HANDLE_VALUE) {
+	    snprintf(err, errlen, "Cannot write the AI model file (Windows error "
+		     "%lu). Is the folder read-only?", (unsigned long) GetLastError());
+	    goto done;
+	}
+	LARGE_INTEGER pos;
+	pos.QuadPart = have;
+	SetFilePointerEx(out, pos, NULL, FILE_BEGIN);
+	SetEndOfFile(out);
+
+	buf = (unsigned char *) malloc(256 * 1024);
+	if (!buf) { snprintf(err, errlen, "Out of memory."); goto done; }
+	DWORD last = GetTickCount() - 2000;
+	for (;;) {
+	    if (g_cancel) {
+		snprintf(err, errlen, "Download paused at %.2f of %.2f GB. Open "
+			 "the assistant again to continue.", have / GB, total / GB);
+		goto done;
+	    }
+	    DWORD got = 0;
+	    if (!WinHttpReadData(req, buf, 256 * 1024, &got)) {
+		snprintf(err, errlen, "The download was interrupted (Windows error "
+			 "%lu). Open the assistant again to continue it.",
+			 (unsigned long) GetLastError());
+		goto done;
+	    }
+	    if (got == 0) break;
+	    DWORD wr = 0;
+	    if (!WriteFile(out, buf, got, &wr, NULL) || wr != got) {
+		snprintf(err, errlen, "Writing the AI model failed (Windows error "
+			 "%lu). Is the drive full?", (unsigned long) GetLastError());
+		goto done;
+	    }
+	    have += got;
+	    if (GetTickCount() - last >= 1000) {
+		last = GetTickCount();
+		if (total > 0)
+		    w_status("Downloading the AI model: %.2f of %.2f GB (%d%%). "
+			     "R stays usable; Stop pauses.", have / GB, total / GB,
+			     (int) (100.0 * (double) have / (double) total));
+		else
+		    w_status("Downloading the AI model: %.2f GB. Stop pauses.",
+			     have / GB);
+	    }
+	}
+	CloseHandle(out);
+	out = INVALID_HANDLE_VALUE;
+	if (expect > 0 && have != expect) {
+	    snprintf(err, errlen, "The download ended early (%.2f of %.2f GB). "
+		     "Open the assistant again to continue it.", have / GB, expect / GB);
+	    goto done;
+	}
+    }
+
+    if (sha_hex && *sha_hex) {
+	w_status("Checking the downloaded model...");
+	char sum[65];
+	if (!ai_sha256_file(wpart, sum)) {
+	    snprintf(err, errlen, g_cancel ? "The check was cancelled."
+		     : "Could not read the downloaded model to check it.");
+	    goto done;
+	}
+	if (strcasecmp(sum, sha_hex) != 0) {
+	    DeleteFileW(wpart);
+	    snprintf(err, errlen, "The download was damaged (checksum mismatch) "
+		     "and has been deleted. Open the assistant again to retry.");
+	    goto done;
+	}
+    }
+    if (!MoveFileExW(wpart, wdest, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+	snprintf(err, errlen, "Could not put the downloaded model in place "
+		 "(Windows error %lu).", (unsigned long) GetLastError());
+	goto done;
+    }
+    ok = 1;
+
+done:
+    if (out != INVALID_HANDLE_VALUE) CloseHandle(out);
+    if (req) WinHttpCloseHandle(req);
+    if (con) WinHttpCloseHandle(con);
+    if (ses) WinHttpCloseHandle(ses);
+    free(buf);
+    free(host);
+    free(wpart);
+    free(wurl);
+    free(wdest);
+    return ok;
+}
+
+static unsigned __stdcall ai_download_worker(void *unused)
+{
+    char err[512];
+    int ok = ai_download_file(CFG.model_url, CFG.model, CFG.model_sha256,
+			      CFG.model_bytes, err, sizeof err);
+    if (ok)
+	w_status("The AI model is downloaded.");
+    else
+	w_status("%s", err);
+    PostMessage(g_msgwin, WM_AI_DLDONE, (WPARAM) ok, 0);
+    return 0;
+}
+
 /* ================================================================== */
 /* user interface -- main (R) thread only                              */
 /* ================================================================== */
@@ -1546,7 +1855,17 @@ static int ai_clipboard_put(const char *u8)
     memcpy(p, w, bytes);
     GlobalUnlock(h);
     free(w);
-    if (!OpenClipboard(NULL)) { GlobalFree(h); return 0; }
+    /* Own the clipboard with a real window: with a NULL owner,
+       EmptyClipboard leaves no owner and SetClipboardData may fail.  And
+       another program (a clipboard manager, say) may hold the clipboard
+       open for a moment, so try for up to half a second. */
+    HWND owner = g_panel ? (HWND) getHandle(g_panel) : NULL;
+    int opened = 0;
+    for (int i = 0; i < 20 && !opened; i++) {
+	opened = OpenClipboard(owner);
+	if (!opened) Sleep(25);
+    }
+    if (!opened) { GlobalFree(h); return 0; }
     EmptyClipboard();
     if (!SetClipboardData(CF_UNICODETEXT, h)) {
 	CloseClipboard(); GlobalFree(h); return 0;
@@ -1635,6 +1954,15 @@ static void ai_drain_pending(void)
 
 /* Window procedure of the message-only window.  Runs on the R main
    thread, from inside doevent(), i.e. inside R_ProcessEvents(). */
+static unsigned __stdcall ai_warmup(void *unused);   /* below */
+
+static void ai_start_warmup(void)
+{
+    unsigned tid;
+    HANDLE th = (HANDLE) _beginthreadex(NULL, 0, ai_warmup, NULL, 0, &tid);
+    if (th) CloseHandle(th);
+}
+
 static LRESULT CALLBACK ai_msgproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
@@ -1649,6 +1977,13 @@ static LRESULT CALLBACK ai_msgproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_AI_DONE:
 	ai_drain_pending();
 	ai_finish_turn((int) wp);
+	return 0;
+    case WM_AI_DLDONE:
+	InterlockedExchange(&g_downloading, 0);
+	InterlockedExchange(&g_cancel, 0);
+	InterlockedExchange(&g_busy, 0);
+	ai_set_busy(0);
+	if (wp && CFG.autostart) ai_start_warmup();
 	return 0;
     }
     return DefWindowProc(hwnd, msg, wp, lp);
@@ -1679,9 +2014,72 @@ extern font consolefn;                       /* from console.c */
 int Rgui_Edit(const char *filename, int enc, const char *title, int modal);
 #define AI_CE_UTF8 1
 
+static int ai_model_missing(void)
+{
+    return CFG.model[0] && !ai_file_exists(CFG.model);
+}
+
+/* If the model is missing and there is somewhere to fetch it from, ask
+   whether to download it now and start the download if so.  Returns 1
+   when the model is missing (asked or not), 0 when there is nothing to
+   do here. */
+static int ai_offer_download(void)
+{
+    if (!ai_model_missing() || !CFG.model_url[0]) return 0;
+    if (g_downloading) {
+	ai_set_status("The AI model is still downloading. Stop pauses it.");
+	return 1;
+    }
+    if (g_busy) return 1;
+
+    char part[MAX_PATH + 8], q[800];
+    snprintf(part, sizeof part, "%s.part", CFG.model);
+    wchar_t *wpart = u8_to_wcs(part);
+    long long have = wpart ? ai_file_size_w(wpart) : -1;
+    free(wpart);
+    if (have > 0 && CFG.model_bytes > 0)
+	snprintf(q, sizeof q,
+		 "Part of the AI model is already downloaded (%.1f of %.1f GB).\n\n"
+		 "Continue the download now?", have / 1e9, CFG.model_bytes / 1e9);
+    else if (CFG.model_bytes > 0)
+	snprintf(q, sizeof q,
+		 "The AI model is not on this computer yet.\n\n"
+		 "Download it now? It is %.1f GB and is needed only once. "
+		 "The download runs in the background, R stays usable, and an "
+		 "interrupted download continues where it stopped.",
+		 CFG.model_bytes / 1e9);
+    else
+	snprintf(q, sizeof q,
+		 "The AI model is not on this computer yet.\n\nDownload it now?");
+    if (askyesno(q) != YES) {
+	ai_set_status("The AI model is not downloaded. Send a question to be asked again.");
+	return 1;
+    }
+
+    if (InterlockedCompareExchange(&g_busy, 1, 0) != 0) return 1;
+    InterlockedExchange(&g_cancel, 0);
+    InterlockedExchange(&g_downloading, 1);
+    ai_set_busy(1);
+    ai_set_status("Starting the download...");
+    unsigned tid;
+    HANDLE th = (HANDLE) _beginthreadex(NULL, 0, ai_download_worker, NULL, 0, &tid);
+    if (!th) {
+	InterlockedExchange(&g_downloading, 0);
+	InterlockedExchange(&g_busy, 0);
+	ai_set_busy(0);
+	ai_set_status("Could not start the download.");
+	return 1;
+    }
+    if (g_worker) CloseHandle(g_worker);
+    g_worker = th;
+    return 1;
+}
+
 static void ai_do_send(control c)
 {
     if (!g_hinput) return;
+    /* No model yet: offer the download; the question stays in the box. */
+    if (ai_offer_download()) return;
     if (InterlockedCompareExchange(&g_busy, 1, 0) != 0) {
 	ai_set_status("Still answering the previous question.");
 	return;
@@ -1733,7 +2131,7 @@ static void ai_do_send(control c)
 static void ai_do_stop(control c)
 {
     if (!g_busy) return;
-    ai_set_status("Stopping...");
+    ai_set_status(g_downloading ? "Pausing the download..." : "Stopping...");
     ai_stop_generation();
 }
 
@@ -1992,11 +2390,8 @@ void aichat_toggle(void)
 	}
 	show(g_panel);
 	if (g_input) { addto(g_panel); show(g_input); }
-	if (CFG.autostart) {
-	    unsigned tid;
-	    HANDLE th = (HANDLE) _beginthreadex(NULL, 0, ai_warmup, NULL, 0, &tid);
-	    if (th) CloseHandle(th);
-	}
+	if (!ai_offer_download() && CFG.autostart)
+	    ai_start_warmup();
 	return;
     }
 

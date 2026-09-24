@@ -15,7 +15,13 @@ param(
     [Parameter(Mandatory = $true)] [string]$ProbeDir,
     [Parameter(Mandatory = $true)] [string]$TreeDir,
     [switch]$WithModel,
-    [int]$AnswerTimeout = 600
+    [int]$AnswerTimeout = 600,
+
+    # First-run download pass: answer the offer with Yes and expect the
+    # model to arrive at DownloadedModel with DownloadBytes bytes.
+    [switch]$ExpectDownload,
+    [string]$DownloadedModel = '',
+    [long]$DownloadBytes = 0
 )
 
 Set-StrictMode -Version 2.0
@@ -118,6 +124,25 @@ public static class Win {
         foreach (char c in s) PostMessageW(h, 0x0102, (IntPtr) c, IntPtr.Zero);   // WM_CHAR
     }
 
+    // The task-modal MessageBox that askyesno() shows: class #32770.
+    public static IntPtr FindDialog(int pid) {
+        foreach (IntPtr h in TopWindows(pid))
+            if (IsWindowVisible(h) && ClassOf(h) == "#32770") return h;
+        return IntPtr.Zero;
+    }
+    public static string DialogText(IntPtr dlg) {
+        var sb = new StringBuilder();
+        foreach (IntPtr h in Descendants(dlg))
+            if (ClassOf(h) == "Static") sb.Append(Text(h)).Append(' ');
+        return sb.ToString();
+    }
+    public static bool ClickButton(IntPtr dlg, string label) {
+        foreach (IntPtr h in Descendants(dlg))
+            if (ClassOf(h) == "Button" && (Text(h) ?? "").Replace("&", "") == label)
+                return Click(h);
+        return false;
+    }
+
     static string MenuText(IntPtr m, int pos) {
         var sb = new StringBuilder(256);
         GetMenuStringW(m, (uint) pos, sb, 256, 0x400);   // MF_BYPOSITION
@@ -182,6 +207,17 @@ function Wait-Until([scriptblock]$Condition, [double]$Seconds) {
     return [bool](& $Condition)
 }
 
+function Wait-Dialog([double]$Seconds) {
+    $script:dlg = [IntPtr]::Zero
+    $null = Wait-Until { $script:dlg = [Win]::FindDialog($ProcessId); $script:dlg -ne [IntPtr]::Zero } $Seconds
+    return $script:dlg
+}
+
+function Answer-Dialog([IntPtr]$Dialog, [string]$Button) {
+    [void][Win]::ClickButton($Dialog, $Button)
+    return (Wait-Until { -not [Win]::IsWindowVisible($Dialog) } 5)
+}
+
 function Find-ByText([IntPtr]$Parent, [string]$Needle) {
     foreach ($h in [Win]::Descendants($Parent)) {
         $t = [Win]::Text($h)
@@ -213,6 +249,14 @@ New-Item -ItemType Directory -Force -Path $ProbeDir | Out-Null
 
 # The Copy code check writes to the clipboard; put the user's text back.
 $savedClipboard = Get-Clip
+
+# Several checks go through the clipboard (console input, Copy code).  If
+# Windows refuses clipboard access to every program, which happens on a
+# locked session and elsewhere, say so up front: otherwise those checks
+# fail looking like RGui bugs.
+$clipUsable = (Set-Clip 'rgui-gui-test') -and ((Get-Clip) -eq 'rgui-gui-test')
+Check 'Windows clipboard is usable (needed by several checks)' $clipUsable `
+      'even clip.exe is refused: unlock the session or close whatever holds the clipboard, then rerun'
 
 $frame = [IntPtr]::Zero
 $found = Wait-Until {
@@ -271,6 +315,46 @@ foreach ($b in 'Send', 'Stop', 'Copy code', 'To editor', 'New chat') {
 if (-not ($hist -and $inbox -and $buttons.ContainsKey('Send'))) { exit 96 }
 $send = $buttons['Send']; $stop = $buttons['Stop']
 Check 'transcript shows the welcome text' (([Win]::Text($hist)) -like '*Local R assistant*')
+
+# The status line is the panel's GraphApp label, window class "Rgui".
+$statusLabel = [Win]::Descendants($panel) | Where-Object { [Win]::ClassOf($_) -eq 'Rgui' } | Select-Object -First 1
+function Status { if ($statusLabel) { return [string]([Win]::Text($statusLabel)) } else { return '' } }
+
+if (-not $WithModel) {
+    # No model on disk: the first open offers to download it.
+    $dlg = Wait-Dialog 10
+    $offer = ''
+    if ($dlg -ne [IntPtr]::Zero) { $offer = [Win]::DialogText($dlg) }
+    Check 'missing model: opening the panel offers the download' `
+          ($offer -like '*not on this computer*' -or $offer -like '*already downloaded*') "dialog: $offer"
+
+    if ($ExpectDownload) {
+        Check 'the offer says how big it is' ($offer -like '*GB*')
+        Check 'answering Yes closes the offer' (Answer-Dialog $dlg 'Yes')
+        Check 'download runs (Send disabled, Stop enabled)' `
+              (Wait-Until { -not [Win]::IsWindowEnabled($send) -and [Win]::IsWindowEnabled($stop) } 10)
+        Check 'status line shows download progress' (Wait-Until { (Status) -like '*Downloading the AI model*' } 15) "status: $(Status)"
+        $ran = Test-ConsoleRuns $console 30
+        Check 'R runs console code while the model downloads' ($ran -and -not [Win]::IsWindowEnabled($send))
+        Check 'download completes' (Wait-Until { [Win]::IsWindowEnabled($send) } 180)
+        $len = -1
+        if (Test-Path $DownloadedModel) { $len = (Get-Item $DownloadedModel).Length }
+        Check 'model file in place with the published size' ($len -eq $DownloadBytes) "size: $len"
+        Check 'no .part file left behind' (-not (Test-Path "$DownloadedModel.part"))
+        # The test file is not a real model, so the server must refuse it
+        # and the status line must say why.
+        Check 'a bad model file is reported in the status line' `
+              (Wait-Until { (Status) -like '*stopped while starting*' -or (Status) -like '*exited unexpectedly*' } 120) "status: $(Status)"
+        Check 'console still runs R code' (Test-ConsoleRuns $console 30)
+        Stop-Process -Id $ProcessId -Force
+        if ($savedClipboard) { [void](Set-Clip $savedClipboard) }
+        Write-Host ''
+        if ($script:Failures -eq 0) { Write-Host 'GUI: PASSED' -ForegroundColor Green }
+        else { Write-Host ("GUI: FAILED ({0})" -f $script:Failures) -ForegroundColor Red }
+        exit $script:Failures
+    }
+    Check 'answering No closes the offer' (Answer-Dialog $dlg 'No')
+}
 Check 'Send enabled, Stop disabled when idle' ([Win]::IsWindowEnabled($send) -and -not [Win]::IsWindowEnabled($stop))
 
 Toggle
@@ -323,7 +407,7 @@ if ($WithModel) {
     [void][Win]::Click($buttons['Copy code'])
     $clipOk = Wait-Until { $c = Get-Clip; $c -and $c.Contains('mean(') } 5
     $clip = Get-Clip
-    Check 'Copy code puts the code on the clipboard' $clipOk "clipboard: $clip"
+    Check 'Copy code puts the code on the clipboard' $clipOk "clipboard: '$clip'  status: $(Status)"
     Check 'Copy code strips the ``` fences' ($clip -and -not $clip.Contains('```'))
 
     [void][Win]::Click($buttons['To editor'])
@@ -357,10 +441,14 @@ if ($WithModel) {
     Toggle; $null = Wait-Until { [Win]::IsWindowVisible($panel) } 5
     Check 'hiding and reopening keeps the conversation' ([Win]::Text($hist) -eq $before)
 } else {
-    # No model on disk: the turn must fail cleanly and R must not notice.
+    # No model on disk: Send offers the download again instead of failing.
     [void][Win]::SetText($inbox, $question)
     [void][Win]::Click($send)
-    Check 'without a model the turn ends by itself' (Wait-Until { [Win]::IsWindowEnabled($send) } 60)
+    $dlg = Wait-Dialog 10
+    Check 'Send without a model offers the download again' ($dlg -ne [IntPtr]::Zero)
+    if ($dlg -ne [IntPtr]::Zero) { [void](Answer-Dialog $dlg 'No') }
+    Check 'declining leaves the panel idle' (Wait-Until { [Win]::IsWindowEnabled($send) } 10)
+    Check 'the question stays in the input box' ([Win]::Text($inbox) -eq $question)
     Check 'console still runs R code after the failed turn' (Test-ConsoleRuns $console 30)
 }
 

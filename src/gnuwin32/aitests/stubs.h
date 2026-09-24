@@ -49,3 +49,6 @@ int   Rgui_Edit(const char *f, int e, const char *t, int m)
 
 char *libintl_dgettext(const char *d, const char *m)
 { (void)d; return (char *) m; }
+
+/* The first-run download offer asks; the harness always declines. */
+int   GA_askyesno(const char *q) { printf("    [ask] %.60s...\n", q); return NO; }
