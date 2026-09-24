@@ -900,6 +900,7 @@ function Invoke-Installer {
     if ($p.ExitCode -ne 0) { Stop-WithError "Inno Setup compiler (exit code $($p.ExitCode))" }
     $exe = Join-Path $outDir ('RGui-AI-{0}-setup.exe' -f $ver.Text)
     if (-not (Test-Path $exe)) { Stop-WithError "the compiler reported success but $exe is missing" }
+    $script:InstallerExe = $exe
     $sha = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant()
     # One LF-terminated line, as sha256sum writes it: with CRLF, 'sha256sum -c'
     # takes the CR for part of the file name and reports the file missing.
@@ -999,7 +1000,32 @@ function Invoke-Doctor {
 
 # ---------------------------------------------------------------------
 
+# Where each command left its results; printed at the end of every run.
+function Show-Output([string]$Cmd) {
+    $rgui = Join-Path $Tree 'bin\x64\Rgui.exe'
+    $lines = switch ($Cmd) {
+        { $_ -in 'full', 'quick', 'dev', 'run' } { @("Rgui.exe    $rgui") }
+        'package'   { @("stick       $Dist   (copy its contents to the stick's root)") }
+        'installer' { @("installer   $script:InstallerExe", "checksum    $script:InstallerExe.sha256") }
+        'deploy'    { @("stick       " + $Drive.TrimEnd('\', ':') + ':\') }
+        'fetch'     { @("downloads   $Cache") }
+        'test'      { @("logs        $Logs") }
+        'doctor'    { @("build root  $BuildRoot",
+                        "Rgui.exe    $rgui",
+                        "stick       $Dist",
+                        "installer   $(Join-Path $BuildRoot 'installer')",
+                        "downloads   $Cache",
+                        "logs        $Logs") }
+        default     { @() }
+    }
+    if (@($lines).Count -gt 0) {
+        Write-Host 'output:' -ForegroundColor Green
+        foreach ($l in $lines) { Write-Host "  $l" -ForegroundColor Green }
+    }
+}
+
 Initialize-Toolchain
+$script:InstallerExe = $null
 $watch = [System.Diagnostics.Stopwatch]::StartNew()
 switch ($Command) {
     'doctor'  { Invoke-Doctor }
@@ -1014,4 +1040,5 @@ switch ($Command) {
     'deploy'  { Invoke-Deploy }
     'clean'   { Invoke-Clean }
 }
+Show-Output $Command
 Write-Host ("done: {0} in {1}" -f $Command, (Format-Elapsed $watch)) -ForegroundColor Green
