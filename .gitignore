@@ -1,0 +1,38 @@
+# ---- the AI assistant's payload: large, downloaded, never committed ----
+*.gguf
+/ai/
+
+# ---- in-tree Windows build output (R_HOME) ----
+/bin/
+/library/
+/include/
+/modules/
+/Tcl/
+/Makeconf
+/SVN-REVISION.bak
+
+# ---- build intermediates ----
+*.o
+*.a
+*.dll
+*.exe
+*.res
+src/gnuwin32/MkRules
+src/gnuwin32/MkRules.local
+src/gnuwin32/fixed/fixhtml
+src/gnuwin32/fixed/fixetc
+src/gnuwin32/fixed/fixai
+src/gnuwin32/fixed/fixdoc
+
+# headers generated into src/include by 'make fixfiles'
+src/include/config.h
+src/include/Rconfig.h
+src/include/Rversion.h
+src/include/Rmath.h
+src/include/iconv.h
+src/include/psignal.h
+src/include/trioremap.h
+src/include/libintl.h
+
+# ---- test harness output ----
+src/gnuwin32/aitests/expected.txt

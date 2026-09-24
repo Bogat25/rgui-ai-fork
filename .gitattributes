@@ -1,0 +1,8 @@
+# Store and check out every file byte-for-byte.  R's sources are LF, and
+# a checkout with core.autocrlf=true would otherwise turn configure,
+# tools/GETVERSION and the Makefiles into CRLF, which breaks the build.
+* -text
+
+# Windows batch files are kept in CRLF, as cmd.exe expects.
+*.cmd -text
+*.bat -text
