@@ -28,7 +28,7 @@ void  GA_enable(control c) { (void)c; }
 void  GA_disable(control c) { (void)c; }
 void  GA_resize(control c, rect r) { (void)c; (void)r; }
 void  GA_settext(control c, const char *t)
-{ (void)c; if (t) fprintf(stderr, "    [status] %s\n", t); }
+{ (void)c; if (t) printf("    [status] %s\n", t); }
 void  GA_settextfont(control c, font f) { (void)c; (void)f; }
 void  GA_setclose(control c, actionfn f) { (void)c; (void)f; }
 void  GA_setresize(control c, drawfn f) { (void)c; (void)f; }
@@ -42,10 +42,10 @@ rect  GA_newrect(int a, int b, int c, int d)
 { rect r; r.x = a; r.y = b; r.width = c; r.height = d; return r; }
 rect  GA_objrect(objptr o) { (void)o; return GA_newrect(0, 0, 600, 500); }
 
-void  R_ShowMessage(const char *s) { fprintf(stderr, "    [msgbox] %s\n", s); }
+void  R_ShowMessage(const char *s) { printf("    [msgbox] %s\n", s); }
 RECT *RgetMDIsize(void) { static RECT r = {0, 0, 1280, 800}; return &r; }
 int   Rgui_Edit(const char *f, int e, const char *t, int m)
-{ (void)e; (void)m; fprintf(stderr, "    [editor] %s (%s)\n", t, f); return 0; }
+{ (void)e; (void)m; printf("    [editor] %s (%s)\n", t, f); return 0; }
 
 char *libintl_dgettext(const char *d, const char *m)
 { (void)d; return (char *) m; }

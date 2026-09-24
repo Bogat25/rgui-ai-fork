@@ -232,6 +232,76 @@ static void test_cancel(int port)
     conv_clear();
 }
 
+
+/* ---- against the real model -------------------------------------- */
+
+/* Drives the production path end to end: ai_worker() finds no server,
+   starts llama-server itself with the same command line Rgui uses,
+   waits for the model to load, streams an answer and stops the server.
+   Usage: test_aichat --real <llama-server.exe> <model.gguf> <port> */
+static int test_real(const char *exe, const char *model, int port,
+                     const char *extra)
+{
+    snprintf(CFG.server_exe, sizeof CFG.server_exe, "%s", exe);
+    snprintf(CFG.model, sizeof CFG.model, "%s", model);
+    CFG.port = port;
+    CFG.startup_timeout = 600;
+    CFG.request_timeout = 600;
+    CFG.n_predict = 256;
+    snprintf(CFG.extra_args, sizeof CFG.extra_args, "%s", extra);  /* default: empty */
+
+    char ai[MAX_PATH];
+    snprintf(ai, sizeof ai, "%s", exe);
+    for (int up = 0; up < 2; up++) {
+        char *sl = strrchr(ai, '\\');
+        if (sl) *sl = '\0';
+    }
+    snprintf(CFG.system_prompt_file, sizeof CFG.system_prompt_file,
+             "%s\\system_prompt.txt", ai);
+    snprintf(CFG.context_dir, sizeof CFG.context_dir, "%s\\context", ai);
+    printf("prompt  %s\ncontext %s\n", CFG.system_prompt_file, CFG.context_dir);
+
+    conv_clear();
+    DWORD t0 = GetTickCount();
+    char *req = ai_build_request(
+        "Write one line of R code that computes the mean of c(2, 4, 9). "
+        "Answer with only a fenced r code block.");
+    ai_worker(req);
+    double secs = (GetTickCount() - t0) / 1000.0;
+
+    ai_lock();
+    char *got = g_pending.n ? db_release(&g_pending) : NULL;
+    ai_unlock();
+
+    /* Show what the status line would have said.  Only now, after the
+       answer has been taken out of g_pending: pumping also delivers
+       WM_AI_DATA, which would move the text somewhere else. */
+    g_status = (control) STUB;
+    MSG m;
+    while (PeekMessage(&m, NULL, 0, 0, PM_REMOVE)) DispatchMessage(&m);
+
+    printf("---- model answer (%.1f s including model load) ----\n%s\n"
+           "-----------------------------------------------------\n",
+           secs, got ? got : "(nothing)");
+
+    char *code = got ? ai_extract_code(got) : NULL;
+    t_ok("real model: server started by aichat.c", g_srv_proc != NULL);
+    t_ok("real model: produced an answer", got != NULL && *got);
+    t_ok("real model: answer mentions mean()", got && strstr(got, "mean"));
+    t_ok("real model: code is in a fenced block", got && strstr(got, "```"));
+    t_ok("real model: no <think> text leaked", got && !strstr(got, "<think>"));
+    t_ok("real model: Copy code finds code", code && *code);
+    free(code);
+    free(got);
+
+    ai_server_stop();
+    t_ok("real model: server stopped", g_srv_proc == NULL);
+
+    printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "PASSED",
+           failures, failures == 1 ? "" : "s");
+    return failures ? 1 : 0;
+}
+
 int main(int argc, char **argv)
 {
     ai_defaults();
@@ -242,6 +312,9 @@ int main(int argc, char **argv)
     InitializeCriticalSection(&g_srv_cs); g_srv_cs_up = 1;
     db_init(&g_pending);
     ai_make_msgwin();
+
+    if ((argc == 5 || argc == 6) && !strcmp(argv[1], "--real"))
+        return test_real(argv[2], argv[3], atoi(argv[4]), argc == 6 ? argv[5] : "");
 
     test_json();
     test_think_filter();

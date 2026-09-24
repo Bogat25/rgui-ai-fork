@@ -24,22 +24,65 @@ E:\
 `ai\` is created by the build, with `system_prompt.txt` and
 `context\README.txt` in it. You fill `llama\`, `models\` and `context\`.
 
-Budget on a 128 GB stick: R about 250 MB, llama.cpp about 100 MB, the
-model about 2.5 GB. Everything else is free space.
+Budget on a 128 GB stick: R about 300 MB, llama.cpp about 60 MB, the
+model 2.7 GB. Everything else is free space.
 
-## 2. Build R with the assistant
+## 2. Build it: the pipeline
 
-Follow `src/gnuwin32/INSTALL` as usual — the assistant adds no new build
-dependency. In short, with Rtools installed:
+Everything from here to a finished pendrive is automated by `rgui.cmd`
+in the repository root (a wrapper around `rgui.ps1` that does not depend
+on the PowerShell execution policy). It needs Rtools45 installed and
+about 15 GB free on the build drive; nothing else, and no administrator
+rights. No `MkRules.local` is needed with Rtools45.
 
 ```
-cd src\gnuwin32
-copy MkRules.dist MkRules.local
-rem  edit MkRules.local: set EXT_LIBS and the toolchain paths
-make all recommended
+rgui doctor           what is installed, downloaded and built
+rgui fetch            Tcl/Tk bundle, llama.cpp, and the model (2.7 GB,
+                      SHA-256 checked, resumable)
+rgui full             build R, base and recommended packages
+rgui test -Real -Gui  every test there is, see below
+rgui package          assemble the stick layout in D:\rgui-build\dist
+rgui deploy -Drive E: copy it onto the stick
 ```
 
-The changes for the assistant are:
+The build happens in `D:\rgui-build\tree`, not in the repository:
+R's makefiles do not cope with spaces in paths, and it keeps the
+repository clean. Only files you changed are copied across, so builds
+after the first are incremental. Use `-BuildRoot` to build elsewhere.
+
+### The edit-build-run loop
+
+```
+rgui dev              sync, rebuild R.dll + the .exe files, start Rgui
+rgui test             compile check with -Werror + unit and protocol tests
+```
+
+`dev` takes seconds after the first full build. It closes any Rgui or
+llama-server started from the build tree first, because a running Rgui
+keeps R.dll locked. It starts Rgui with a throwaway home in
+`D:\rgui-build\devhome`, so your own R settings are not involved.
+
+`quick` (inside `dev`) rebuilds the core libraries and `R.dll`. After
+editing anything outside `src/gnuwin32` and `src/main` (a base package,
+say), use `rgui full` instead; it is incremental too.
+
+### Tests
+
+| Command | What it proves | Time |
+|---|---|---|
+| `rgui test` | `aichat.c` compiles warning-free with the production flags; JSON, SSE, chunked HTTP, the `<think>` filter, Stop and a missing server behave; captured real `llama-server` output parses correctly | ~10 s |
+| `rgui test -Real` | `aichat.c` starts the real `llama-server` itself, the model loads, answers with a fenced code block, and the server is stopped again | ~30 s |
+| `rgui test -Gui` | drives the built `Rgui.exe` through window messages: menu entry, panel, all buttons, hide/show/close, Copy code, To editor, R running console code **while** the model answers, a missing model failing politely, and `llama-server` dying with Rgui | ~1–2 min |
+
+When something fails, the script prints the first error lines of the
+build log (usually the cause) and the log's path.
+
+`test -Gui` opens and closes real RGui windows and sends them menu
+commands, clicks and text. Leave them alone while it runs: a click or a
+keystroke of your own changes what the test sees. It borrows the
+clipboard for the Copy code check and puts your text back afterwards.
+
+### What the build changes
 
 | File | Change |
 |---|---|
@@ -52,45 +95,31 @@ The changes for the assistant are:
 | `src/gnuwin32/fixed/etc/Rai.conf` | new, the settings file |
 | `src/gnuwin32/fixed/ai/` | new, templates |
 
-Then copy the installed tree to `E:\R`.
+## 3. Doing it by hand
 
-## 3. Get llama.cpp
+Only needed without the pipeline. With Rtools45's toolchain first on
+`PATH`, `TAR=/usr/bin/tar` and `TAR_OPTIONS=--force-local`, unzip the
+Tcl/Tk bundle from CRAN's Rtools45 files page into the source root, run
+`sh tools/link-recommended`, then in `src/gnuwin32` run `make -j all`
+and **afterwards, separately,** `make -j recommended`: started together
+under `-j`, the second races the first and fails.
 
-Download a prebuilt Windows x64 CPU binary from the llama.cpp releases
-page (`llama-<build>-bin-win-cpu-x64.zip`, or the AVX2 variant, which
-every i5 from 2013 onwards supports). Unzip it and copy the contents —
-`llama-server.exe` **and every DLL next to it** — into
+Then put a llama.cpp Windows CPU build (`llama-<build>-bin-win-cpu-x64.zip`
+from its GitHub releases; **all** the DLLs next to `llama-server.exe`)
+into `R\ai\llama\`, and `Qwen3.5-4B-Q4_K_M.gguf` from
+`unsloth/Qwen3.5-4B-GGUF` on Hugging Face into `R\ai\models\`.
+Check the server once with `R\ai\llama\llama-server.exe --version`.
 
-```
-E:\R\ai\llama\
-```
+## 4. The model
 
-Do not put only the .exe there: it will fail to start with a missing-DLL
-error that Windows shows in a dialog the assistant cannot read.
-
-Check it once from a command prompt:
-
-```
-E:\R\ai\llama\llama-server.exe --version
-```
-
-## 4. Get the model
-
-Download **Qwen3.5-4B, GGUF, Q4_K_M** and save it as
-
-```
-E:\R\ai\models\Qwen3.5-4B-Q4_K_M.gguf
-```
-
-If the file you download has a different name, either rename it or point
-`model =` in `E:\R\etc\Rai.conf` at the real name. Q4_K_M for a 4B model
-is about 2.4–2.6 GB on disk and needs roughly 3.5–4 GB of RAM at
-`ctx_size = 8192`, which is comfortable on a 16 GB machine.
+Qwen3.5-4B Q4_K_M is 2.7 GB on disk and needs roughly 3.5–4 GB of RAM at
+`ctx_size = 8192`, which is comfortable on a 16 GB machine. If you use a
+file with a different name, point `model =` in `R\etc\Rai.conf` at it.
 
 Expect something like 5–12 tokens per second on an i5 with no GPU: a
 paragraph of explanation plus a short code block takes well under a
 minute. The first load after plugging the stick in is the slow part,
-because 2.5 GB has to come off USB.
+because 2.7 GB has to come off USB.
 
 ## 5. Add the course material
 
@@ -123,8 +152,9 @@ it. The console, the editor, graphics and packages keep working.
 |---|---|
 | `The model server was not found` | Check `server_exe` in `etc\Rai.conf` and that `llama-server.exe` really is in `ai\llama\`. |
 | `The model file was not found` | Check `model` in `etc\Rai.conf` against the actual filename in `ai\models\`. |
-| `The model server exited unexpectedly` | Run `llama-server.exe` by hand from a command prompt with the same `-m` argument and read its output. Usually a missing DLL or a corrupt download. |
-| `The model did not become ready within ...` | A slow stick. Raise `startup_timeout`, and try `extra_args = --no-mmap`. |
+| `The model server stopped while starting: ...` | The rest of the line is the server's own error. An `invalid argument` means an option in `extra_args` that this llama.cpp does not know. The full output is in `%TEMP%\rgui-llama-server.log`. |
+| `The model server exited unexpectedly` | It died without printing an error. Run `llama-server.exe` by hand from a command prompt with the same `-m` argument and read its output. Usually a missing DLL or a corrupt download. |
+| `The model did not become ready within ...` | A slow stick. Raise `startup_timeout`. With llama.cpp b11153, `extra_args = --load-mode none` reads the model into RAM up front, which can help on slow USB sticks. |
 | `Could not connect to the model server` | Something else is on port 8713. Change `port` in `etc\Rai.conf`. |
 | Nothing happens at all, no menu entry | `enabled = no` in `etc\Rai.conf`, or the file has a typo. Delete it to fall back to the defaults. |
 

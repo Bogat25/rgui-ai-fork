@@ -10,6 +10,25 @@ import io, json, socket, sys, threading, time
 
 PORT = int(sys.argv[1])
 
+# --replay FILE: send a captured llama-server SSE stream instead of the
+# synthetic one.  With --expected, write the text that stream should
+# produce, taken from its "content" deltas.
+REPLAY = None
+if "--replay" in sys.argv:
+    REPLAY = sys.argv[sys.argv.index("--replay") + 1]
+
+
+def replay_expected(path):
+    text = []
+    for line in io.open(path, encoding="utf-8").read().split("\n"):
+        if not line.startswith("data: ") or line[6:].strip() == "[DONE]":
+            continue
+        for ch in json.loads(line[6:]).get("choices", []):
+            c = ch.get("delta", {}).get("content")
+            if isinstance(c, str):
+                text.append(c)
+    return "".join(text)
+
 PIECES = [
     None,                      # role-only chunk: "content": null
     "<thi", "nk>", "I should use t.test here.", "</thi", "nk>",
@@ -87,8 +106,11 @@ def handle(conn):
 
     # Deliberately awkward framing: one byte stream cut at arbitrary
     # points, so SSE records and even JSON tokens straddle chunks.
-    stream = "".join(sse_record(p) for p in PIECES) + "data: [DONE]\n\n"
-    raw = stream.encode("utf-8")
+    if REPLAY:
+        raw = io.open(REPLAY, "rb").read()
+    else:
+        stream = "".join(sse_record(p) for p in PIECES) + "data: [DONE]\n\n"
+        raw = stream.encode("utf-8")
     i, size = 0, 7
     while i < len(raw):
         conn.sendall(chunk(raw[i:i + size]))
@@ -117,7 +139,8 @@ def main():
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 2 and sys.argv[2] == "--expected":
-        io.open("expected.txt","w",encoding="utf-8",newline="").write(EXPECTED)
+    if "--expected" in sys.argv:
+        text = replay_expected(REPLAY) if REPLAY else EXPECTED
+        io.open("expected.txt","w",encoding="utf-8",newline="").write(text)
     else:
         main()
