@@ -901,7 +901,9 @@ function Invoke-Installer {
     $exe = Join-Path $outDir ('RGui-AI-{0}-setup.exe' -f $ver.Text)
     if (-not (Test-Path $exe)) { Stop-WithError "the compiler reported success but $exe is missing" }
     $sha = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant()
-    Set-Content -Path "$exe.sha256" -Encoding ASCII -Value ("{0}  {1}" -f $sha, (Split-Path $exe -Leaf))
+    # One LF-terminated line, as sha256sum writes it: with CRLF, 'sha256sum -c'
+    # takes the CR for part of the file name and reports the file missing.
+    [System.IO.File]::WriteAllText("$exe.sha256", ("{0}  {1}`n" -f $sha, (Split-Path $exe -Leaf)))
     Note ('{0}  {1:N0} MB' -f $exe, ((Get-Item $exe).Length / 1MB))
     Note "sha256 $sha"
 }
