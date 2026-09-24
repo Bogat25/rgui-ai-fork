@@ -43,6 +43,7 @@ rgui full             build R, base and recommended packages
 rgui test -Real -Gui  every test there is, see below
 rgui package          assemble the stick layout in D:\rgui-build\dist
 rgui deploy -Drive E: copy it onto the stick
+rgui installer        build RGui-AI-<version>-setup.exe (no model inside)
 ```
 
 The build happens in `D:\rgui-build\tree`, not in the repository:
@@ -72,7 +73,8 @@ say), use `rgui full` instead; it is incremental too.
 |---|---|---|
 | `rgui test` | `aichat.c` compiles warning-free with the production flags; JSON, SSE, chunked HTTP, the `<think>` filter, Stop and a missing server behave; captured real `llama-server` output parses correctly | ~10 s |
 | `rgui test -Real` | `aichat.c` starts the real `llama-server` itself, the model loads, answers with a fenced code block, and the server is stopped again | ~30 s |
-| `rgui test -Gui` | drives the built `Rgui.exe` through window messages: menu entry, panel, all buttons, hide/show/close, Copy code, To editor, R running console code **while** the model answers, a missing model failing politely, and `llama-server` dying with Rgui | ~1–2 min |
+| `rgui test -Gui` | drives the built `Rgui.exe` through window messages: menu entry, panel, all buttons, hide/show/close, Copy code, To editor, R running console code **while** the model answers, the first-run download offer and the download itself, a missing model failing politely, and `llama-server` dying with Rgui | ~1–2 min |
+| `rgui test -Installer` | installs the last built setup.exe into a folder whose name has a space in it, starts RGui from the Start-menu launcher, upgrades over it (your `Rai.conf`, prompt and notes must survive) and uninstalls it (the program and model go, your `work` folder stays) | ~1 min |
 
 When something fails, the script prints the first error lines of the
 build log (usually the cause) and the log's path.
@@ -110,7 +112,41 @@ into `R\ai\llama\`, and `Qwen3.5-4B-Q4_K_M.gguf` from
 `unsloth/Qwen3.5-4B-GGUF` on Hugging Face into `R\ai\models\`.
 Check the server once with `R\ai\llama\llama-server.exe --version`.
 
-## 4. The model
+## 4. Releases
+
+Pushing a version tag builds and publishes the installer on GitHub:
+
+```
+git tag v0.1.1
+git push origin v0.1.1
+```
+
+`.github/workflows/release.yml` then installs Rtools45 and Inno Setup
+(both pinned to a version and a SHA-256), runs `rgui fetch`, `full`,
+`test`, `installer` and `test -Installer` on a Windows runner, and
+publishes `RGui-AI-0.1.1-setup.exe` with its checksum as the release
+"RGui AI 0.1.1". A tag with a suffix such as `v0.2.0-rc1` becomes a
+pre-release. A tag that does not look like `v1.2.3` is rejected before
+anything is built. **Actions > release > Run workflow** builds and tests
+without publishing; the installer is then an artifact of the run.
+
+The GUI tests do not run there: they need a desktop session. Run
+`rgui test -Real -Gui` here before tagging.
+
+The installer is not code-signed, so Windows SmartScreen warns the first
+time; *More info > Run anyway*.
+
+## 5. The model
+
+It is not in the installer: at 2.7 GB it would exceed GitHub's 2 GB
+limit for release files, and it would make every update 2.7 GB. The
+first time the assistant is opened without it, RGui asks whether to
+download it. The download runs in the background (R stays usable, the
+status line shows progress, Stop pauses it), continues where it stopped
+if interrupted, uses the machine's proxy settings, and the file is only
+used once its SHA-256 matches the one in `Rai.conf`. After that,
+everything works offline. `model_url =` (empty) in `Rai.conf` turns the
+offer off; the model can then be copied into `R\ai\models\` by hand.
 
 Qwen3.5-4B Q4_K_M is 2.7 GB on disk and needs roughly 3.5–4 GB of RAM at
 `ctx_size = 8192`, which is comfortable on a 16 GB machine. If you use a
@@ -121,7 +157,7 @@ paragraph of explanation plus a short code block takes well under a
 minute. The first load after plugging the stick in is the slow part,
 because 2.7 GB has to come off USB.
 
-## 5. Add the course material
+## 6. Add the course material
 
 Put the assignment brief, the lecturer's notes, the house reporting
 style and a few worked examples into `E:\R\ai\context\` as UTF-8 `.md`
@@ -131,19 +167,21 @@ has standing rules that apply to every answer.
 
 No indexing step, no restart: edit a file, ask the next question.
 
-## 6. First run
+## 7. First run
 
 1. Copy `E:\R\ai\Start-R.cmd` to `E:\Start-R.cmd`.
 2. Double-click it. RGui opens exactly as it always does.
 3. **Misc → AI assistant**, or Ctrl+T.
-4. The status line says `Loading the model...` for a minute or two the
-   first time, then `Ready.`
-5. Ask something. Use **Copy code** or **To editor**; run the code
+4. Without the model, RGui offers to download it (2.7 GB, once). Say Yes
+   and keep working in R; the status line shows the progress.
+5. The status line then says `Loading the model...` for a minute or two
+   the first time, then `Ready.`
+6. Ask something. Use **Copy code** or **To editor**; run the code
    yourself.
-6. Ctrl+T again hides the panel. Ctrl+T once more brings it back with
+7. Ctrl+T again hides the panel. Ctrl+T once more brings it back with
    the conversation intact.
 
-## 7. If something goes wrong
+## 8. If something goes wrong
 
 The assistant is a separate process, so none of this can take RGui with
 it. The console, the editor, graphics and packages keep working.
@@ -151,6 +189,9 @@ it. The console, the editor, graphics and packages keep working.
 | Status line says | Do this |
 |---|---|
 | `The model server was not found` | Check `server_exe` in `etc\Rai.conf` and that `llama-server.exe` really is in `ai\llama\`. |
+| `Not enough free space for the AI model` | The drive needs 2.7 GB free (less if part of the download is already there). |
+| `Could not reach the download server` | No internet, or a proxy Windows does not know about. Open the assistant again later: the download continues where it stopped. |
+| `The download was damaged (checksum mismatch)` | The partial file was deleted; open the assistant again to download it afresh. A persistent mismatch means `model_url` and `model_sha256` in `Rai.conf` do not belong together. |
 | `The model file was not found` | Check `model` in `etc\Rai.conf` against the actual filename in `ai\models\`. |
 | `The model server stopped while starting: ...` | The rest of the line is the server's own error. An `invalid argument` means an option in `extra_args` that this llama.cpp does not know. The full output is in `%TEMP%\rgui-llama-server.log`. |
 | `The model server exited unexpectedly` | It died without printing an error. Run `llama-server.exe` by hand from a command prompt with the same `-m` argument and read its output. Usually a missing DLL or a corrupt download. |
@@ -161,7 +202,7 @@ it. The console, the editor, graphics and packages keep working.
 To turn the whole feature off, set `enabled = no`. The menu entry then
 does not appear and no assistant code runs.
 
-## 8. What it does not do
+## 9. What it does not do
 
 - It does not run code for you. Ever. You copy it and run it yourself.
 - It does not reach the network. It talks to `127.0.0.1` only, and the

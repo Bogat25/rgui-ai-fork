@@ -1,0 +1,187 @@
+# Build RGui AI and, for a v* tag, publish the installer as a GitHub release.
+#
+#   git tag v0.1.1 && git push origin v0.1.1      -> release "RGui AI 0.1.1"
+#   git tag v0.2.0-rc1 && git push origin v0.2.0-rc1 -> pre-release
+#   Actions tab > release > Run workflow          -> build and test only
+#
+# The model is not in the installer (2.7 GB; release assets are limited to
+# 2 GB): RGui downloads it the first time the assistant is opened.
+
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # No spaces: R's makefiles do not quote paths.
+  BUILD_ROOT: C:\rgui-build
+  RTOOLS_DIR: C:\rtools45-rgui
+  RTOOLS_FILE: rtools45-6768-6492.exe
+  RTOOLS_SHA256: 614c7378150a012e70b16edcfe5236dcead47f491f1f54203ea8d451c7743a75
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 240
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Work out the version
+        id: version
+        shell: pwsh
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          if ($env:REF_TYPE -eq 'tag') {
+            if ($env:REF_NAME -notmatch '^v(\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?)$') {
+              throw "Tag '$($env:REF_NAME)' is not like v0.1.1 or v0.2.0-rc1"
+            }
+            $v = $Matches[1]
+          } else {
+            $v = "0.0.0-dev.$($env:RUN_NUMBER)"
+          }
+          $pre = if ($v.Contains('-')) { 'true' } else { 'false' }
+          "version=$v"       >> $env:GITHUB_OUTPUT
+          "prerelease=$pre"  >> $env:GITHUB_OUTPUT
+          Write-Host "version $v (prerelease: $pre)"
+
+      - name: Cache downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ env.BUILD_ROOT }}\cache
+            C:\rgui-dl
+          key: rgui-downloads-${{ env.RTOOLS_FILE }}-${{ hashFiles('rgui.ps1') }}
+          restore-keys: rgui-downloads-${{ env.RTOOLS_FILE }}-
+
+      - name: Install Rtools45 (pinned, checksum verified)
+        shell: pwsh
+        run: |
+          $exe = "C:\rgui-dl\$env:RTOOLS_FILE"
+          New-Item -ItemType Directory -Force -Path C:\rgui-dl | Out-Null
+          if (-not (Test-Path $exe)) {
+            curl.exe --fail --location --retry 3 --silent --show-error -o $exe `
+              "https://cran.r-project.org/bin/windows/Rtools/rtools45/files/$env:RTOOLS_FILE"
+          }
+          $got = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant()
+          if ($got -ne $env:RTOOLS_SHA256) { Remove-Item $exe; throw "Rtools installer checksum mismatch: $got" }
+          $p = Start-Process -FilePath $exe -Wait -PassThru -ArgumentList `
+               '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=$env:RTOOLS_DIR"
+          if ($p.ExitCode -ne 0) { throw "Rtools installer exited with $($p.ExitCode)" }
+          & "$env:RTOOLS_DIR\x86_64-w64-mingw32.static.posix\bin\gcc.exe" --version | Select-Object -First 1
+          Get-PSDrive C | ForEach-Object { 'C: {0:N0} GB free' -f ($_.Free / 1GB) }
+
+      - name: Fetch Tcl/Tk, llama.cpp and Inno Setup (checksum verified)
+        run: .\rgui.cmd fetch -NoModel -BuildRoot $env:BUILD_ROOT -Rtools $env:RTOOLS_DIR
+        shell: pwsh
+
+      - name: Build R, base and recommended packages
+        run: .\rgui.cmd full -BuildRoot $env:BUILD_ROOT -Rtools $env:RTOOLS_DIR
+        shell: pwsh
+
+      - name: Test (compile checks, unit and protocol tests, downloader)
+        run: .\rgui.cmd test -BuildRoot $env:BUILD_ROOT -Rtools $env:RTOOLS_DIR
+        shell: pwsh
+
+      - name: Build the installer
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: .\rgui.cmd installer -Version $env:VERSION -BuildRoot $env:BUILD_ROOT -Rtools $env:RTOOLS_DIR
+        shell: pwsh
+
+      - name: Test the installer (install, start, upgrade, uninstall)
+        run: .\rgui.cmd test -Installer -BuildRoot $env:BUILD_ROOT -Rtools $env:RTOOLS_DIR
+        shell: pwsh
+
+      - name: Write release notes
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          $exe = "$env:BUILD_ROOT\installer\RGui-AI-$env:VERSION-setup.exe"
+          $sha = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant()
+          $mb  = '{0:N0}' -f ((Get-Item $exe).Length / 1MB)
+          @"
+          R 4.6.1 (RGui) with a local AI assistant for statistics coursework:
+          **Misc > AI assistant**, or **Ctrl+T**.
+
+          ### Install
+          Download ``RGui-AI-$env:VERSION-setup.exe`` ($mb MB) and run it. No administrator
+          rights are needed: it installs for the current user, or into any folder you choose,
+          a USB stick included. The installer is not code-signed, so Windows SmartScreen may
+          warn; choose *More info > Run anyway*.
+
+          ### First use of the assistant
+          RGui offers to download the AI model (Qwen3.5-4B, Q4_K_M, 2.7 GB). It is needed
+          once, downloads in the background while R stays usable, continues if interrupted,
+          and is checked against its published SHA-256. After that everything works offline.
+
+          ### Checksum
+          SHA-256 of the installer:
+          ``$sha``
+
+          Built from $env:COMMIT.
+          "@ | Set-Content -Encoding utf8 "$env:BUILD_ROOT\installer\release-notes.md"
+
+      - name: Upload the installer
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: installer
+          path: |
+            ${{ env.BUILD_ROOT }}\installer\RGui-AI-*-setup.exe
+            ${{ env.BUILD_ROOT }}\installer\RGui-AI-*-setup.exe.sha256
+            ${{ env.BUILD_ROOT }}\installer\release-notes.md
+          if-no-files-found: error
+
+      - name: Upload build logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: logs
+          path: ${{ env.BUILD_ROOT }}\logs
+
+  release:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download the installer
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: installer
+          path: dist
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.build.outputs.version }}
+          PRERELEASE: ${{ needs.build.outputs.prerelease }}
+        run: |
+          flags=()
+          if [ "$PRERELEASE" = "true" ]; then flags+=(--prerelease); fi
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "RGui AI $VERSION" \
+            --notes-file dist/release-notes.md \
+            --verify-tag \
+            "${flags[@]}" \
+            dist/RGui-AI-*-setup.exe dist/RGui-AI-*-setup.exe.sha256

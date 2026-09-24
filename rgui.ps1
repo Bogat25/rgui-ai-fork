@@ -27,8 +27,11 @@
         run       start the built Rgui with the AI payload in place
         dev       quick, then run
         test      static checks + tests; -Real drives the real model,
-                  -Gui drives the built Rgui.exe (menu, panel, buttons)
+                  -Gui drives the built Rgui.exe (menu, panel, buttons),
+                  -Installer installs, upgrades and uninstalls the setup.exe
         package   assemble the pendrive layout in <BuildRoot>\dist
+        installer build RGui-AI-<version>-setup.exe (Inno Setup; the model
+                  is not inside, RGui downloads it on first use)
         deploy    copy dist to a pendrive (-Drive E:), keeping course notes
         clean     delete the build tree; downloads are kept
 
@@ -43,7 +46,7 @@
 param(
     [Parameter(Position = 0)]
     [ValidateSet('doctor', 'fetch', 'full', 'quick', 'run', 'dev', 'test',
-                 'package', 'deploy', 'clean')]
+                 'package', 'installer', 'deploy', 'clean')]
     [string]$Command = 'doctor',
 
     # Where the build tree, downloads, logs and dist live.  No spaces.
@@ -67,11 +70,22 @@ param(
     # test: also drive the built Rgui.exe through its window messages.
     [switch]$Gui,
 
+    # test: also install the last built installer into a folder with a
+    # space in its name, start it, upgrade it and uninstall it.
+    [switch]$Installer,
+
     # deploy: target drive, e.g. E:
     [string]$Drive = '',
 
     # deploy: allow overwriting an R folder this script did not create.
-    [switch]$Force
+    [switch]$Force,
+
+    # installer: version, e.g. 0.1.1 or 0.2.0-rc1.  Default: the v-tag on
+    # HEAD if there is one, else 0.0.0-dev.
+    [string]$Version = '',
+
+    # installer: ISCC.exe to use; found automatically when empty.
+    [string]$InnoSetup = ''
 )
 
 Set-StrictMode -Version 2.0
@@ -89,6 +103,14 @@ $ModelUrl    = "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/$Mod
 $ModelSha256 = '00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4'
 $ModelSize   = 2740937888
 $LlamaRepo   = 'ggml-org/llama.cpp'
+
+# Everything that ends up in the installer is checked against these.
+$TclSha256   = 'd83744f6627a8f1facaaf3caa04e5d29764606b8246c7c6d91358a570489f61f'
+$LlamaSha256 = @{ 'b11153' = '569d19826f3fb00a3fc2df7bd68ab9ad33e5c0d6d69ce022b24372700cee7931' }
+
+$InnoFile    = 'innosetup-7.1.0-x64.exe'
+$InnoUrl     = "https://github.com/jrsoftware/issrc/releases/download/is-7_1_0/$InnoFile"
+$InnoSha256  = '0362a383ed217d4c4239b5933866dd96d3eb2102737da92f80f6057a4b40df2f'
 
 # ---------------------------------------------------------------------
 # Paths
@@ -266,6 +288,53 @@ function Get-Download([string]$Url, [string]$Dest) {
     Move-Item -Force $part $Dest
 }
 
+# Download unless already cached, then insist on the pinned checksum.
+function Get-VerifiedDownload([string]$Url, [string]$Dest, [string]$Sha256, [string]$Label) {
+    if (-not (Test-Path $Dest)) { Say "downloading $Label"; Get-Download $Url $Dest }
+    if ($Sha256) {
+        $got = (Get-FileHash -Algorithm SHA256 $Dest).Hash.ToLowerInvariant()
+        if ($got -ne $Sha256) {
+            Remove-Item -Force $Dest
+            Stop-WithError "$Label does not match its pinned SHA-256 (got $got); deleted, run fetch again"
+        }
+        Note "$Label`: verified"
+    } else {
+        Note "$Label`: cached (no pinned checksum for this version)"
+    }
+}
+
+function Find-InnoSetup {
+    if ($InnoSetup) { return $InnoSetup }
+    $candidates = @((Join-Path $BuildRoot 'tools\innosetup\ISCC.exe'))
+    foreach ($key in 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 7_is1',
+                     'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 7_is1',
+                     'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 7_is1') {
+        try {
+            $loc = (Get-ItemProperty $key -ErrorAction Stop).InstallLocation
+            if ($loc) { $candidates += (Join-Path $loc 'ISCC.exe') }
+        } catch { }
+    }
+    $candidates += "$env:ProgramFiles\Inno Setup 7\ISCC.exe"
+    foreach ($c in $candidates) { if ($c -and (Test-Path $c)) { return $c } }
+    return $null
+}
+
+# Inno Setup, per user and without administrator rights, into the build
+# root, so every machine (CI included) builds with the same version.
+function Install-InnoSetup {
+    $iscc = Join-Path $BuildRoot 'tools\innosetup\ISCC.exe'
+    if (Test-Path $iscc) { Note 'Inno Setup: installed'; return }
+    $exe = Join-Path $Cache $InnoFile
+    Get-VerifiedDownload $InnoUrl $exe $InnoSha256 'Inno Setup 7.1.0'
+    Say 'installing Inno Setup for the current user'
+    $dir = Join-Path $BuildRoot 'tools\innosetup'
+    $p = Start-Process -FilePath $exe -Wait -PassThru -ArgumentList `
+        '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/CURRENTUSER', '/NOICONS', "/DIR=$dir"
+    if ($p.ExitCode -ne 0 -or -not (Test-Path $iscc)) {
+        Stop-WithError "installing Inno Setup failed (exit code $($p.ExitCode))"
+    }
+}
+
 function Resolve-LlamaBuild {
     if ($LlamaBuild -ne 'latest') { return $LlamaBuild }
     Note 'asking GitHub for the newest llama.cpp Windows CPU build'
@@ -310,18 +379,14 @@ function Test-ModelFile([string]$Path) {
 function Invoke-Fetch {
     New-Item -ItemType Directory -Force -Path $Cache | Out-Null
 
-    $tcl = Join-Path $Cache $TclBundle
-    if (Test-Path $tcl) { Note "Tcl/Tk bundle: cached" }
-    else { Say "downloading $TclBundle"; Get-Download $TclUrl $tcl }
+    Get-VerifiedDownload $TclUrl (Join-Path $Cache $TclBundle) $TclSha256 'Tcl/Tk bundle'
 
     $build = Resolve-LlamaBuild
     $zipName = "llama-$build-bin-win-cpu-x64.zip"
-    $zip = Join-Path $Cache $zipName
-    if (Test-Path $zip) { Note "llama.cpp $build`: cached" }
-    else {
-        Say "downloading llama.cpp $build"
-        Get-Download "https://github.com/$LlamaRepo/releases/download/$build/$zipName" $zip
-    }
+    Get-VerifiedDownload "https://github.com/$LlamaRepo/releases/download/$build/$zipName" `
+        (Join-Path $Cache $zipName) $LlamaSha256[$build] "llama.cpp $build"
+
+    Install-InnoSetup
 
     if ($NoModel) { Note 'model: skipped (-NoModel)'; return }
     $model = Join-Path $Cache $ModelFile
@@ -421,9 +486,11 @@ function Invoke-Quick {
     Invoke-Make 'rbuild' 'quick-rbuild'
 }
 
-function Start-DevRgui {
+# -NoPayload: start as is.  The GUI tests need the model to stay missing,
+# and Install-Payload would quietly put it back.
+function Start-DevRgui([switch]$NoPayload) {
     if (-not (Test-Built)) { Stop-WithError "no build yet; run '.\rgui full' first." }
-    Install-Payload
+    if (-not $NoPayload) { Install-Payload }
     foreach ($d in $DevHome, (Join-Path $DevHome 'library'), (Join-Path $DevHome 'tmp')) {
         New-Item -ItemType Directory -Force -Path $d | Out-Null
     }
@@ -462,7 +529,7 @@ function Invoke-GuiTests {
     if (Test-Path $model) { Move-Item -Force $model $hidden }
     try {
         Say 'GUI test, pass 1: model missing'
-        $p = Start-DevRgui
+        $p = Start-DevRgui -NoPayload
         & $smoke -ProcessId $p.Id -ProbeDir $probe -TreeDir $Tree
         $rc1 = $LASTEXITCODE
     } finally {
@@ -470,6 +537,47 @@ function Invoke-GuiTests {
         if (Test-Path $hidden) { Move-Item -Force $hidden $model }
     }
     if ($rc1 -ne 0) { Stop-WithError "GUI test without a model ($rc1 failed checks)" }
+
+    # Pass 1b: the first-run download, from a local server into a scratch
+    # model path, through a scratch copy of Rai.conf.
+    Say 'GUI test, pass 1b: first-run model download'
+    Stop-DevProcesses
+    $out = Join-Path $BuildRoot 'testout'
+    New-Item -ItemType Directory -Force -Path $out | Out-Null
+    $conf = Join-Path $Tree 'etc\Rai.conf'
+    $backup = "$conf.gui-test-backup"
+    $testModel = Join-Path $Tree 'ai\models\rgui-gui-test.gguf'
+    $python = (Get-Command python -ErrorAction Stop).Source
+    $server = Join-Path $Tree 'src\gnuwin32\aitests\fakeserver.py'
+    $port = Get-FreePort
+    Push-Location $out
+    try { & $python $server $port --expected } finally { Pop-Location }
+    $sha = (Get-Content (Join-Path $out 'download.sha256') -Raw).Trim()
+    $size = [long](Get-Content (Join-Path $out 'download.size') -Raw).Trim()
+    foreach ($f in $testModel, "$testModel.part") { if (Test-Path $f) { [System.IO.File]::Delete($f) } }
+    Copy-Item $conf $backup -Force
+    $srv = $null
+    try {
+        Add-Content -Path $conf -Encoding ASCII -Value @(
+            '', '## gui test overrides',
+            'model = ai/models/rgui-gui-test.gguf',
+            "model_url = http://127.0.0.1:$port/file/model.gguf?slow",
+            "model_sha256 = $sha",
+            "model_bytes = $size")
+        $srv = Start-Process -FilePath $python -ArgumentList "`"$server`"", $port `
+                             -WorkingDirectory $out -WindowStyle Hidden -PassThru
+        if (-not (Wait-Port $port 15)) { Stop-WithError "fake server did not start on port $port" }
+        $p = Start-DevRgui -NoPayload
+        & $smoke -ProcessId $p.Id -ProbeDir $probe -TreeDir $Tree -ExpectDownload `
+                 -DownloadedModel $testModel -DownloadBytes $size
+        $rc1b = $LASTEXITCODE
+    } finally {
+        Stop-DevProcesses
+        if ($srv) { Stop-Process -Id $srv.Id -Force -ErrorAction SilentlyContinue }
+        Move-Item -Force $backup $conf
+        foreach ($f in $testModel, "$testModel.part") { if (Test-Path $f) { [System.IO.File]::Delete($f) } }
+    }
+    if ($rc1b -ne 0) { Stop-WithError "GUI test of the first-run download ($rc1b failed checks)" }
 
     if (-not (Test-Path $model)) { Warn 'no model downloaded: skipping GUI pass 2'; return }
     Say 'GUI test, pass 2: real model'
@@ -539,7 +647,7 @@ function Invoke-Test {
 
     Say 'building the test harness'
     $sh = "cd $t/src/gnuwin32/aitests && " +
-              "gcc -O1 -g -I. -I.. $cflags test_aichat.c -o $o/test_aichat.exe -lws2_32"
+              "gcc -O1 -g -I. -I.. $cflags test_aichat.c -o $o/test_aichat.exe -lws2_32 -lwinhttp -lbcrypt"
     if ((Invoke-Bash $sh 'test-build') -ne 0) { Stop-WithError 'test harness build' }
     $exe = Join-Path $out 'test_aichat.exe'
 
@@ -593,42 +701,183 @@ function Invoke-Test {
     }
 
     if ($Gui) { Invoke-GuiTests }
+    if ($Installer) { Invoke-InstallerTests }
+}
+
+# Install the newest setup.exe for the current user into a folder whose
+# name has a space in it -- like the default, "...\Programs\RGui AI" -- and
+# check what a user would notice.  Leaves nothing behind: the last step is
+# the uninstaller.
+function Invoke-InstallerTests {
+    $setup = Get-ChildItem (Join-Path $BuildRoot 'installer') -Filter 'RGui-AI-*-setup.exe' -ErrorAction SilentlyContinue |
+             Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if (-not $setup) { Stop-WithError "no installer built yet; run '.\rgui installer' first." }
+    $app = Join-Path $BuildRoot 'itest\RGui AI'
+    $key = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{A1E92B8A-2AFD-45A8-BAF7-C1803C90FB17}_is1'
+    $lnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'RGui AI.lnk'
+    $script:ItFail = 0
+    function It([string]$What, [bool]$Ok, [string]$Detail = '') {
+        Write-Host ("{0,-60} {1}" -f $What, $(if ($Ok) { 'ok' } else { 'FAIL' })) `
+                   -ForegroundColor $(if ($Ok) { 'Gray' } else { 'Red' })
+        if (-not $Ok) { $script:ItFail++; if ($Detail) { Write-Host "      $Detail" -ForegroundColor Yellow } }
+    }
+    function Install-Setup {
+        $p = Start-Process -FilePath $setup.FullName -Wait -PassThru -ArgumentList `
+             '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=`"$app`""
+        return $p.ExitCode
+    }
+    function Stop-Installed {
+        Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like "$app\*" } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        Start-Sleep -Milliseconds 800
+    }
+
+    Say "installer test: $($setup.Name) into '$app'"
+    Stop-Installed
+    if (Test-Path (Join-Path $app 'unins000.exe')) {
+        Start-Process -FilePath (Join-Path $app 'unins000.exe') -Wait -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES'
+    }
+
+    It 'silent install succeeds' ((Install-Setup) -eq 0)
+    foreach ($rel in 'Start-R.cmd', 'R\bin\x64\Rgui.exe', 'R\etc\Rai.conf', 'R\ai\system_prompt.txt',
+                     'R\ai\llama\llama-server.exe', 'R\ai\models', 'R\library\MASS', 'R\Tcl\bin') {
+        It ("installed: $rel") (Test-Path (Join-Path $app $rel))
+    }
+    It 'no model inside the installer' (@(Get-ChildItem (Join-Path $app 'R\ai\models') -Filter '*.gguf').Count -eq 0)
+    It 'no source tree or build scripts installed' `
+       (-not (Test-Path (Join-Path $app 'R\src')) -and -not (Test-Path (Join-Path $app 'R\rgui.ps1')))
+    It 'Start menu shortcut created' (Test-Path $lnk)
+    It 'per-user uninstall entry registered' (Test-Path $key)
+
+    # The launcher, from a path with a space: R used to die at start with
+    # "'R_TempDir' contains space" here.
+    Start-Process -FilePath (Join-Path $app 'Start-R.cmd') -WorkingDirectory $app -WindowStyle Minimized
+    $proc = $null
+    for ($i = 0; $i -lt 40 -and -not $proc; $i++) {
+        Start-Sleep -Milliseconds 500
+        $proc = Get-CimInstance Win32_Process -Filter "Name='Rgui.exe'" |
+                Where-Object { $_.ExecutablePath -like "$app\*" } | Select-Object -First 1
+    }
+    It 'Start-R.cmd starts Rgui from the install folder' ($null -ne $proc)
+    Start-Sleep -Seconds 10
+    It 'Rgui is still running 10 s later (R started up)' `
+       ($proc -and [bool](Get-Process -Id $proc.ProcessId -ErrorAction SilentlyContinue))
+    Stop-Installed
+
+    # Upgrade: the files people edit must survive.
+    Add-Content -Path (Join-Path $app 'R\etc\Rai.conf') -Value '# my own setting'
+    Set-Content -Path (Join-Path $app 'R\ai\system_prompt.txt') -Value 'my custom prompt'
+    Set-Content -Path (Join-Path $app 'R\ai\context\05-anova.md') -Value '# my notes'
+    It 'reinstalling over it succeeds' ((Install-Setup) -eq 0)
+    It 'upgrade keeps an edited Rai.conf' ((Get-Content (Join-Path $app 'R\etc\Rai.conf') -Raw) -match 'my own setting')
+    It 'upgrade keeps an edited prompt' `
+       ((Get-Content (Join-Path $app 'R\ai\system_prompt.txt') -Raw).Trim() -eq 'my custom prompt')
+    It 'upgrade keeps course notes' (Test-Path (Join-Path $app 'R\ai\context\05-anova.md'))
+
+    # Uninstall: the program and the downloaded model go, the work folder stays.
+    Set-Content -Path (Join-Path $app 'R\ai\models\stand-in.gguf') -Value 'model'
+    New-Item -ItemType Directory -Force -Path (Join-Path $app 'work') | Out-Null
+    Set-Content -Path (Join-Path $app 'work\my-analysis.R') -Value 'x <- 1'
+    $p = Start-Process -FilePath (Join-Path $app 'unins000.exe') -Wait -PassThru -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES'
+    Start-Sleep -Seconds 2
+    It 'silent uninstall succeeds' ($p.ExitCode -eq 0)
+    It 'program files removed' (-not (Test-Path (Join-Path $app 'R\bin\x64\Rgui.exe')))
+    It 'downloaded model removed' (-not (Test-Path (Join-Path $app 'R\ai\models\stand-in.gguf')))
+    It 'work folder kept' (Test-Path (Join-Path $app 'work\my-analysis.R'))
+    It 'Start menu shortcut removed' (-not (Test-Path $lnk))
+    It 'uninstall entry removed' (-not (Test-Path $key))
+
+    if ($script:ItFail -ne 0) { Stop-WithError "installer test ($script:ItFail failed checks)" }
+    Write-Host 'INSTALLER: PASSED' -ForegroundColor Green
 }
 
 # ---------------------------------------------------------------------
 # Packaging
 # ---------------------------------------------------------------------
 
-function Invoke-Package {
-    if (-not (Test-Built)) { Stop-WithError "no build yet; run '.\rgui full' first." }
-    Install-Payload
-    $dstR = Join-Path $Dist 'R'
+# What a user needs at run time, into <Root>\R, and Start-R.cmd into
+# <Root>.  The source tree and build scaffolding stay behind.  Used by both
+# 'package' and 'installer', so the two cannot drift apart.
+# -WithoutModel leaves the .gguf out but keeps ai\models, which the
+# first-run download writes into.
+function Copy-Runtime([string]$Root, [switch]$WithoutModel) {
+    $dstR = Join-Path $Root 'R'
     New-Item -ItemType Directory -Force -Path $dstR | Out-Null
-
-    # Everything a user needs at run time; the source tree and build
-    # scaffolding stay behind.
-    $xd = @('src', 'tests', 'tools', 'm4', 'po') | ForEach-Object { Join-Path $Tree $_ }
-    if ($NoModel) { $xd += (Join-Path $Tree 'ai\models') }
+    $xd = @('src', 'tests', 'tools', 'm4', 'po', 'packaging', '.github') |
+          ForEach-Object { Join-Path $Tree $_ }
+    # build-only files at the top of the tree; the installer's imagedir
+    # target leaves these out as well
+    $top = @('Makeconf', 'INSTALL', 'rgui.ps1', 'rgui.cmd', '.gitattributes', '.gitignore')
     $xf = @('configure', 'configure.ac', 'config.site', 'Makefile.in', 'Makefile.fw',
-            'Makeconf.in', 'SVN-REVISION.bak', '*.sha256-ok') +
-           # build-only files at the top of the tree; the installer's
-           # imagedir target leaves these out as well
-           @('Makeconf', 'INSTALL', 'rgui.ps1', 'rgui.cmd', '.gitattributes', '.gitignore') |
-           ForEach-Object { if ($_.Contains('*')) { $_ } else { Join-Path $Tree $_ } }
-    Say "assembling $Dist"
+            'Makeconf.in', 'SVN-REVISION.bak', '*.sha256-ok', '*.gguf.part', '*.hidden-for-test') +
+          @($top | ForEach-Object { Join-Path $Tree $_ })
+    if ($WithoutModel) { $xf += '*.gguf' }
     & robocopy.exe $Tree $dstR /MIR /XD @xd /XF @xf /NFL /NDL /NJH /NJS /NP /R:1 /W:1 /MT:16 | Out-Null
     if ($LASTEXITCODE -ge 8) { Stop-WithError "robocopy into $dstR failed (code $LASTEXITCODE)" }
     # /MIR ignores excluded names on both sides, so it never removes one
-    # an earlier package left behind; do that here.
-    foreach ($f in 'Makeconf', 'INSTALL', 'rgui.ps1', 'rgui.cmd', '.gitattributes', '.gitignore') {
+    # an earlier copy left behind; do that here.
+    foreach ($f in $top) {
         $old = Join-Path $dstR $f
-        if (Test-Path $old) { Remove-Item -Force $old }
+        if (Test-Path $old) { [System.IO.File]::Delete($old) }
     }
-    Copy-Item (Join-Path $Tree 'ai\Start-R.cmd') (Join-Path $Dist 'Start-R.cmd') -Force
+    if ($WithoutModel) {
+        Get-ChildItem (Join-Path $dstR 'ai\models') -Filter '*.gguf' -ErrorAction SilentlyContinue |
+            ForEach-Object { [System.IO.File]::Delete($_.FullName) }
+    }
+    Copy-Item (Join-Path $Tree 'ai\Start-R.cmd') (Join-Path $Root 'Start-R.cmd') -Force
+}
 
+function Invoke-Package {
+    if (-not (Test-Built)) { Stop-WithError "no build yet; run '.\rgui full' first." }
+    Install-Payload
+    Say "assembling $Dist"
+    Copy-Runtime $Dist -WithoutModel:$NoModel
     $bytes = (Get-ChildItem $Dist -Recurse -File | Measure-Object -Sum Length).Sum
     Note ('size {0:N1} GB' -f ($bytes / 1GB))
     Note "copy the contents of $Dist to the root of the stick, or use '.\rgui deploy -Drive E:'"
+}
+
+# 0.1.1 / 0.2.0-rc1, from -Version, else from a v-tag on HEAD.
+function Resolve-Version {
+    $v = $Version
+    if (-not $v) {
+        $tag = (& git -C $Repo describe --tags --exact-match 2>$null)
+        if ($LASTEXITCODE -eq 0 -and $tag) { $v = "$tag".Trim() } else { $v = '0.0.0-dev' }
+    }
+    $v = $v -replace '^v', ''
+    if ($v -notmatch '^(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.]+)?$') {
+        Stop-WithError "version '$v' is not like 0.1.1 or 0.2.0-rc1"
+    }
+    return @{ Text = $v; Numeric = ('{0}.{1}.{2}.0' -f $Matches[1], $Matches[2], $Matches[3]) }
+}
+
+function Invoke-Installer {
+    if (-not (Test-Built)) { Stop-WithError "no build yet; run '.\rgui full' first." }
+    $iscc = Find-InnoSetup
+    if (-not $iscc) { Stop-WithError "Inno Setup not found; run '.\rgui fetch' (it installs it per user)" }
+    $ver = Resolve-Version
+    Install-Payload
+    $stage = Join-Path $BuildRoot 'stage'
+    Say "staging the installer contents (without the model) in $stage"
+    Copy-Runtime $stage -WithoutModel
+    $outDir = Join-Path $BuildRoot 'installer'
+    New-Item -ItemType Directory -Force -Path $outDir, $Logs | Out-Null
+    $log = Join-Path $Logs ('installer-{0}.log' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    $script:LastLog = $log
+    Say ("compiling the installer, version {0}" -f $ver.Text)
+    $iss = Join-Path $Repo 'packaging\rgui-ai.iss'
+    $p = Start-Process -FilePath $iscc -Wait -PassThru -NoNewWindow `
+        -RedirectStandardOutput $log -RedirectStandardError "$log.err" -ArgumentList @(
+            ('"/DAppVersion={0}"' -f $ver.Text), ('"/DNumericVersion={0}"' -f $ver.Numeric),
+            ('"/DStageDir={0}"' -f $stage), ('"/DOutputDir={0}"' -f $outDir), ('"{0}"' -f $iss))
+    if (Test-Path "$log.err") { Get-Content "$log.err" | Add-Content $log; Remove-Item "$log.err" }
+    if ($p.ExitCode -ne 0) { Stop-WithError "Inno Setup compiler (exit code $($p.ExitCode))" }
+    $exe = Join-Path $outDir ('RGui-AI-{0}-setup.exe' -f $ver.Text)
+    if (-not (Test-Path $exe)) { Stop-WithError "the compiler reported success but $exe is missing" }
+    $sha = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant()
+    Set-Content -Path "$exe.sha256" -Encoding ASCII -Value ("{0}  {1}" -f $sha, (Split-Path $exe -Leaf))
+    Note ('{0}  {1:N0} MB' -f $exe, ((Get-Item $exe).Length / 1MB))
+    Note "sha256 $sha"
 }
 
 function Invoke-Deploy {
@@ -691,6 +940,9 @@ function Invoke-Doctor {
     $py = Get-Command python -ErrorAction SilentlyContinue
     if ($py) { Note "python  $($py.Source)" } else { Warn 'python not found (only needed by test)' }
 
+    $iscc = Find-InnoSetup
+    if ($iscc) { Note "inno    $iscc" } else { Note "inno    missing ('rgui fetch' installs it per user)" }
+
     Say 'disk'
     $drv = Get-PSDrive -Name $BuildRoot.Substring(0, 1)
     Note ('{0}: {1:N0} GB free' -f $drv.Name, ($drv.Free / 1GB))
@@ -730,6 +982,7 @@ switch ($Command) {
     'dev'     { Invoke-Quick; $null = Start-DevRgui }
     'test'    { Invoke-Test }
     'package' { Invoke-Package }
+    'installer' { Invoke-Installer }
     'deploy'  { Invoke-Deploy }
     'clean'   { Invoke-Clean }
 }
