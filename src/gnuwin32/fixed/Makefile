@@ -57,11 +57,12 @@ fixetc: $(ETC) ../MkRules Makefile
 
 ## Templates for the AI assistant (see etc/Rai.conf).  The model and
 ## llama-server.exe are not shipped; these just create the layout and
-## the default prompt, and never overwrite a file the user has edited.
+## the default prompt.  cp -u: a newer template replaces an older copy,
+## while a copy edited after it (so newer) is kept.
 fixai: ai/system_prompt.txt ai/context/README.txt ai/SETUP.md ai/Start-R.cmd
 	-$(MKDIR) -p $(R_HOME)/ai/context $(R_HOME)/ai/models $(R_HOME)/ai/llama
-	-test -f $(R_HOME)/ai/system_prompt.txt || $(CP) -p ai/system_prompt.txt $(R_HOME)/ai
-	-test -f $(R_HOME)/ai/context/README.txt || $(CP) -p ai/context/README.txt $(R_HOME)/ai/context
+	-$(CP) -p -u ai/system_prompt.txt $(R_HOME)/ai
+	-$(CP) -p -u ai/context/README.txt $(R_HOME)/ai/context
 	-$(CP) -p ai/SETUP.md ai/Start-R.cmd $(R_HOME)/ai
 	@$(ECHO) done > fixai
 
