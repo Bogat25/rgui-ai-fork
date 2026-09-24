@@ -45,6 +45,7 @@ void consolepaste(console c);
 void consolepastecmds(console c);
 void consoleselectall(console c);
 void consolecmd(console c, const char *cmd);
+char *consoletailtext(console c, int maxlines);
 void consolenewline(console c);
 void consolehelp(void);
 void consolesetbrk(console c, actionfn, char ch, char mod);

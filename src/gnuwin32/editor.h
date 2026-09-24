@@ -23,6 +23,8 @@ void menueditoropen(control m);
 int editorchecksave(editor c);
 void editorsetfont(font f);
 int Rgui_Edit(const char *filename, int enc, const char *title, int modal);
+char *editor_top_text(char *title, size_t titlelen);
+int editor_insert_top(const char *text, char *title, size_t titlelen);
 
 #define EDITORMAXTITLE 128
 #define MAXNEDITORS 50

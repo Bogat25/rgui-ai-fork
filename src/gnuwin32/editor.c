@@ -921,6 +921,84 @@ static editor neweditor(void)
     return c;
 }
 
+/* For the AI assistant: the script window on top (the one the user
+   last looked at), its text, and inserting at its cursor.  Main thread
+   only. */
+
+static editor editor_topmost(void)
+{
+    if (neditors <= 0) return NULL;
+    /* Siblings in z-order, topmost first: MDI children of the client
+       window, or top-level windows in SDI mode. */
+    HWND h = GetWindow((HWND) getHandle(REditors[0]), GW_HWNDFIRST);
+    for (; h; h = GetWindow(h, GW_HWNDNEXT))
+	for (int i = 0; i < neditors; i++)
+	    if ((HWND) getHandle(REditors[i]) == h) return REditors[i];
+    return NULL;
+}
+
+/* The text of the topmost script window as UTF-8 with \n line ends
+   (malloc'd), its title in title; NULL if no script is open. */
+char *editor_top_text(char *title, size_t titlelen)
+{
+    editor c = editor_topmost();
+    if (!c) return NULL;
+    textbox t = getdata(c);
+    EditorData p = getdata(t);
+    if (title && titlelen) snprintf(title, titlelen, "%s", p->title ? p->title : "");
+    HWND h = (HWND) getHandle(t);
+    int len = GetWindowTextLengthW(h);
+    wchar_t *w = (wchar_t *) malloc(((size_t) len + 2) * sizeof(wchar_t));
+    if (!w) return NULL;
+    GetWindowTextW(h, w, len + 1);
+    int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+    char *u = n > 0 ? (char *) malloc(n) : NULL;
+    if (u) {
+	WideCharToMultiByte(CP_UTF8, 0, w, -1, u, n, NULL, NULL);
+	char *d = u;
+	for (char *s = u; *s; s++) {
+	    if (*s == '\r') { *d++ = '\n'; if (s[1] == '\n') s++; }
+	    else *d++ = *s;
+	}
+	*d = '\0';
+    }
+    free(w);
+    return u;
+}
+
+/* Insert UTF-8 text at the cursor of the topmost script window, as one
+   undoable step, and show that window.  Returns 1 if a script was open. */
+int editor_insert_top(const char *text, char *title, size_t titlelen)
+{
+    editor c = editor_topmost();
+    if (!c) return 0;
+    textbox t = getdata(c);
+    EditorData p = getdata(t);
+    if (title && titlelen) snprintf(title, titlelen, "%s", p->title ? p->title : "");
+    /* RichEdit wants CR line ends. */
+    size_t n = strlen(text);
+    char *crlf = (char *) malloc(2 * n + 1);
+    if (!crlf) return 0;
+    char *d = crlf;
+    for (const char *s = text; *s; s++) {
+	if (*s == '\n') *d++ = '\r';
+	else if (*s != '\r') *d++ = *s;
+    }
+    *d = '\0';
+    int wn = MultiByteToWideChar(CP_UTF8, 0, crlf, -1, NULL, 0);
+    wchar_t *w = wn > 0 ? (wchar_t *) malloc(wn * sizeof(wchar_t)) : NULL;
+    int ok = w != NULL;
+    if (w) {
+	MultiByteToWideChar(CP_UTF8, 0, crlf, -1, w, wn);
+	SendMessageW((HWND) getHandle(t), EM_REPLACESEL, TRUE, (LPARAM) w);
+	free(w);
+    }
+    free(crlf);
+    show(c);
+    show(t);
+    return ok;
+}
+
 /* Change the font used in all running editors */
 
 void editorsetfont(font f)

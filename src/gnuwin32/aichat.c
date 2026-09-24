@@ -79,6 +79,8 @@
 #include "console.h"
 #include "rui.h"
 #include "aichat.h"
+#include "editor.h"
+#include "graphapp/stdimg.h"
 
 #define gettext GA_gettext
 
@@ -411,8 +413,12 @@ int aichat_hotkey(void)
 static const char AI_FALLBACK_PROMPT[] =
     "You are an assistant built into RGui, helping a student with a "
     "statistics course that uses R.\n"
-    "Rules:\n"
-    "- Answer about R, statistics and the course material only.\n"
+    "How to answer:\n"
+    "- Your main job is R, statistics, handling data and writing up "
+    "results for this course. Put your effort there.\n"
+    "- If a question is about something else, answer it briefly and "
+    "plainly. Do not refuse ordinary questions and do not lecture or "
+    "philosophise; where it fits, offer to get back to the course.\n"
     "- Prefer base R and the packages the course already uses. Do not "
     "introduce a new package unless there is no reasonable base R way, "
     "and say so when you do.\n"
@@ -1874,8 +1880,9 @@ static int ai_clipboard_put(const char *u8)
     return 1;
 }
 
-/* Concatenate every fenced code block in text.  Falls back to the whole
-   text when it contains no fences.  Returns malloc'd UTF-8, or NULL. */
+/* Concatenate every fenced code block in text.  Returns malloc'd UTF-8,
+   or NULL when there is no fenced block: then there is no code to copy,
+   and copying the prose instead would put English into an R script. */
 static char *ai_extract_code(const char *text)
 {
     if (!text) return NULL;
@@ -1893,7 +1900,7 @@ static char *ai_extract_code(const char *text)
 	found = 1;
 	p = (*end) ? end + 3 : end;
     }
-    if (!found) { db_free(&out); return xstrdup(text); }
+    if (!found) { db_free(&out); return NULL; }
     /* drop a trailing newline so pasting does not execute a blank line */
     while (out.n && (out.s[out.n-1] == '\n' || out.s[out.n-1] == ' '))
 	out.s[--out.n] = '\0';
@@ -2008,10 +2015,9 @@ static int ai_make_msgwin(void)
 
 extern font consolefn;                       /* from console.c */
 
-/* editor.c.  enc is a cetype_t; 1 is CE_UTF8.  Declared here rather than
+/* Rgui_Edit's enc is a cetype_t; 1 is CE_UTF8.  Spelled out rather than
    including Rinternals.h, which would drag the whole R API into a file
    that deliberately does not use it. */
-int Rgui_Edit(const char *filename, int enc, const char *title, int modal);
 #define AI_CE_UTF8 1
 
 static int ai_model_missing(void)
@@ -2140,10 +2146,13 @@ static void ai_do_copy(control c)
     const char *src = (g_reply_open && g_reply.n) ? g_reply.s : ai_last_reply();
     if (!src) { ai_set_status("Nothing to copy yet."); return; }
     char *code = ai_extract_code(src);
-    if (code && *code && ai_clipboard_put(code))
+    if (!code || !*code)
+	ai_set_status("The last answer has no code block, so nothing was copied. "
+		      "To copy other text, select it above and press Ctrl+C.");
+    else if (ai_clipboard_put(code))
 	ai_set_status("Code copied to the clipboard.");
     else
-	ai_set_status("Nothing to copy yet.");
+	ai_set_status("The clipboard is in use by another program; try again.");
     free(code);
 }
 
@@ -2158,8 +2167,27 @@ static void ai_do_editor(control c)
     char *code = ai_extract_code(src);
     if (!code || !*code) {
 	free(code);
-	ai_set_status("The last answer contained no code.");
+	ai_set_status("The last answer has no code block, so nothing was put "
+		      "in a script.");
 	return;
+    }
+
+    /* A script is open: insert at its cursor, as one undoable step. */
+    {
+	char title[160], msg[320];
+	dynbuf ins;
+	db_init(&ins);
+	db_add(&ins, code);
+	db_add(&ins, "\n");
+	int done = editor_insert_top(ins.s, title, sizeof title);
+	db_free(&ins);
+	if (done) {
+	    free(code);
+	    snprintf(msg, sizeof msg, "Code inserted into \"%s\" at the cursor "
+		     "(Ctrl+Z undoes it). Run it with Ctrl+R.", title);
+	    ai_set_status(msg);
+	    return;
+	}
     }
 
     char dir[MAX_PATH], path[MAX_PATH + 64], title[64];
@@ -2183,6 +2211,170 @@ static void ai_do_editor(control c)
 	ai_set_status("Could not open a script editor window.");
     else
 	ai_set_status("Code opened in a script editor. Run it with Ctrl+R.");
+}
+
+
+/* --- Attach: context from RGui itself --------------------------------- */
+
+/* The last error in console text: from the command that caused it (its
+   "> " prompt line) to the next prompt.  Returns malloc'd text, or NULL
+   when no line starts with "Error". */
+static char *ai_find_last_error(const char *text)
+{
+    if (!text) return NULL;
+    int n = 0, cap = 0;
+    const char **ls = NULL;
+    size_t *ll = NULL;
+    for (const char *p = text; ; ) {
+	const char *e = strchr(p, '\n');
+	size_t len = e ? (size_t) (e - p) : strlen(p);
+	if (n == cap) {
+	    int nc = cap ? cap * 2 : 64;
+	    const char **nls = (const char **) realloc((void *) ls, nc * sizeof *ls);
+	    if (!nls) break;
+	    ls = nls;
+	    size_t *nll = (size_t *) realloc(ll, nc * sizeof *ll);
+	    if (!nll) break;
+	    ll = nll;
+	    cap = nc;
+	}
+	ls[n] = p; ll[n] = len; n++;
+	if (!e) break;
+	p = e + 1;
+    }
+    int err = -1;
+    for (int i = n - 1; i >= 0 && err < 0; i--) {
+	const char *q = ls[i];
+	while (*q == ' ') q++;
+	if (!strncmp(q, "Error", 5)) err = i;
+    }
+    char *res = NULL;
+    if (err >= 0) {
+	int start = err, end = err;
+	for (int i = err - 1; i >= 0 && i >= err - 20; i--)
+	    if (!strncmp(ls[i], "> ", 2)) { start = i; break; }
+	for (int i = err + 1; i < n && i <= err + 30; i++) {
+	    if (!strncmp(ls[i], ">", 1)) break;
+	    end = i;
+	}
+	dynbuf b;
+	db_init(&b);
+	for (int i = start; i <= end; i++) {
+	    db_addn(&b, ls[i], ll[i]);
+	    db_add(&b, "\n");
+	}
+	res = db_release(&b);
+    }
+    free((void *) ls);
+    free(ll);
+    return res;
+}
+
+/* Put a block of context into the question box, where the user can see
+   and edit it before sending.  body is consumed.  keep_end: when it has
+   to be shortened, keep the end (console output) or the start (script). */
+static void ai_attach(const char *intro, char *body, int keep_end, const char *empty)
+{
+    const size_t cap = 6000;
+    if (!body || !*body || !g_hinput) {
+	free(body);
+	ai_set_status(empty);
+	return;
+    }
+    size_t n = strlen(body);
+    const char *b = body;
+    size_t blen = n;
+    int cut = n > cap;
+    if (cut && keep_end) {
+	b = body + n - cap;
+	const char *nl = strchr(b, '\n');
+	if (nl) b = nl + 1;
+	blen = strlen(b);
+    } else if (cut)
+	blen = cap;
+
+    dynbuf d;
+    db_init(&d);
+    char *cur = edit_get_u8(g_hinput);
+    if (cur && *cur && cur[strlen(cur) - 1] != '\n') db_add(&d, "\n");
+    free(cur);
+    db_add(&d, intro);
+    db_add(&d, cut ? (keep_end ? " (the end of it):\n" : " (the start of it):\n") : ":\n");
+    db_add(&d, "```\n");
+    db_addn(&d, b, blen);
+    if (d.n && d.s[d.n - 1] != '\n') db_add(&d, "\n");
+    db_add(&d, "```\n");
+    edit_append_u8(g_hinput, d.s);
+    db_free(&d);
+    free(body);
+    SetFocus(g_hinput);
+    ai_set_status("Added to your question. Edit it if you like, then Send.");
+}
+
+static void ai_do_attach_error(control m)
+{
+    char *tail = RConsole ? consoletailtext(RConsole, 400) : NULL;
+    char *err = ai_find_last_error(tail);
+    free(tail);
+    ai_attach("This is the error I got in the R console", err, 1,
+	      "No error message was found in the recent console output.");
+}
+
+static void ai_do_attach_console(control m)
+{
+    char *tail = RConsole ? consoletailtext(RConsole, 60) : NULL;
+    if (tail) {
+	/* Drop the empty prompt the user is sitting at. */
+	size_t n = strlen(tail);
+	while (n && (tail[n - 1] == ' ' || tail[n - 1] == '\n')) tail[--n] = '\0';
+	if (n && tail[n - 1] == '>') {
+	    tail[--n] = '\0';
+	    while (n && tail[n - 1] == '\n') tail[--n] = '\0';
+	}
+    }
+    ai_attach("Here is my recent R console output", tail, 1, "The console is empty.");
+}
+
+static void ai_do_attach_script(control m)
+{
+    char title[160] = "", intro[240];
+    char *text = editor_top_text(title, sizeof title);
+    snprintf(intro, sizeof intro, "Here is my R script \"%s\"", title);
+    ai_attach(intro, text, 0, "No script is open. Open one with File > Open "
+	      "script, or start one with File > New script.");
+}
+
+/* --- the panel's own Edit commands ----------------------------------- */
+
+/* The chat box that has the focus; fallback when neither has it. */
+static HWND ai_focused_edit(HWND fallback)
+{
+    HWND f = GetFocus();
+    return (f && (f == g_hhist || f == g_hinput)) ? f : fallback;
+}
+
+static void ai_do_edit_copy(control m)
+{
+    HWND f = ai_focused_edit(g_hhist);
+    if (f) SendMessage(f, WM_COPY, 0, 0);
+}
+
+static void ai_do_edit_paste(control m)
+{
+    if (!g_hinput) return;
+    SetFocus(g_hinput);
+    SendMessage(g_hinput, WM_PASTE, 0, 0);
+}
+
+static void ai_do_edit_selectall(control m)
+{
+    HWND f = ai_focused_edit(g_hinput);
+    if (f) SendMessage(f, EM_SETSEL, 0, -1);
+}
+
+static void ai_do_console(control m)
+{
+    if (RConsole) show(RConsole);
 }
 
 static void ai_do_clear(control c)
@@ -2245,7 +2437,16 @@ static void ai_keydown(control c, int ch)
 	ai_do_send(c);
 }
 
-static void ai_menu_noop(control m) { }
+static PkgMenuItems g_pmenu = NULL;
+static HelpMenuItems g_hmenu = NULL;
+
+/* Called as a menu is opened: grey out what does not apply, as the
+   console and the script editor do. */
+static void ai_menu_act(control m)
+{
+    if (g_hmenu) helpmenuact(g_hmenu);
+    if (g_pmenu) pkgmenuact(g_pmenu);
+}
 
 static void ai_hide_panel(control c)
 {
@@ -2254,11 +2455,15 @@ static void ai_hide_panel(control c)
 
 static void ai_menu_close(control m) { ai_hide_panel(NULL); }
 
+static void ai_menu_toggle(control m) { aichat_toggle(); }
+
 static const char AI_WELCOME[] =
     "Local R assistant.\r\n"
-    "Type a question below and press Send (or Ctrl+Enter).\r\n"
+    "Type a question below and press Send (or Ctrl+Enter). The Attach "
+    "menu adds your last error, your script or recent console output.\r\n"
     "Copy code puts the code from the last answer on the clipboard; "
-    "To editor opens it in a script window. Nothing is run for you.\r\n"
+    "To editor puts it into your open script, or a new one. Nothing is "
+    "run for you.\r\n"
     "Nothing leaves this computer.\r\n"
     "\r\n";
 
@@ -2322,18 +2527,72 @@ static int ai_create(void)
 
     setkeydown(g_input, ai_keydown);
 
+    /* The same shape of menu bar and toolbar as the console, so RGui's
+       top bar does not change when the panel is the active window, and
+       so Ctrl+T -- looked up in the menus of the window that has the
+       focus -- hides the panel from inside it. */
+#ifdef USE_MDI
+    if (ismdi() && (RguiMDI & RW_TOOLBAR)) {
+	int btsize = 24;
+	rect r = rect(2, 2, btsize, btsize);
+	control tb, bt;
+	addto(g_panel);
+	tb = newtoolbar(btsize + 4);
+	if (tb) {
+	    addto(tb);
+	    if ((bt = newtoolbutton(open_image, r, menueditoropen)))
+		addtooltip(bt, G_("Open script"));
+	    r.x += btsize + 6;
+	    if ((bt = newtoolbutton(copy_image, r, ai_do_edit_copy)))
+		addtooltip(bt, G_("Copy"));
+	    r.x += btsize + 1;
+	    if ((bt = newtoolbutton(paste_image, r, ai_do_edit_paste)))
+		addtooltip(bt, G_("Paste"));
+	    r.x += btsize + 6;
+	    if ((bt = newtoolbutton(stop_image, r, ai_do_stop)))
+		addtooltip(bt, G_("Stop the answer or the download"));
+	    r.x += btsize + 6;
+	    if ((bt = newtoolbutton(console_image, r, ai_do_console)))
+		addtooltip(bt, G_("Return focus to Console"));
+	}
+    }
+#endif
     addto(g_panel);
-    newmenubar(ai_menu_noop);
+    newmenubar(ai_menu_act);
     newmenu(G_("File"));
-    newmenuitem(G_("Hide assistant"), 0, ai_menu_close);
+    newmenuitem(G_("New script"), 0, menueditornew);
+    newmenuitem(G_("Open script..."), 0, menueditoropen);
+    newmenuitem("-", 0, NULL);
+    newmenuitem(G_("Hide AI assistant"), 0, ai_menu_close);
     newmenu(G_("Edit"));
+    newmenuitem(G_("Copy"), 'C', ai_do_edit_copy);
+    newmenuitem(G_("Paste"), 'V', ai_do_edit_paste);
+    newmenuitem(G_("Select all"), 'A', ai_do_edit_selectall);
+    newmenuitem("-", 0, NULL);
     newmenuitem(G_("Copy code"), 0, ai_do_copy);
     newmenuitem(G_("Open code in script editor"), 0, ai_do_editor);
     newmenuitem("-", 0, NULL);
     newmenuitem(G_("New chat"), 0, ai_do_clear);
+    newmenuitem("-", 0, NULL);
+    newmenuitem(G_("GUI preferences..."), 0, menuconfig);
+    newmenu(G_("Attach"));
+    newmenuitem(G_("Last error from the console"), 0, ai_do_attach_error);
+    newmenuitem(G_("Current script"), 0, ai_do_attach_script);
+    newmenuitem(G_("Recent console output"), 0, ai_do_attach_console);
+    newmenu(G_("Misc"));
+    newmenuitem(G_("Stop the answer or the download"), 0, ai_do_stop);
+    newmenuitem("-", 0, NULL);
+    newmenuitem(G_("AI assistant"), aichat_hotkey(), ai_menu_toggle);
+    g_pmenu = (PkgMenuItems) malloc(sizeof(struct structPkgMenuItems));
+    if (g_pmenu) RguiPackageMenu(g_pmenu);
 #ifdef USE_MDI
     if (ismdi()) newmdimenu();
 #endif
+    {
+	menu hm = newmenu(G_("Help"));
+	g_hmenu = (HelpMenuItems) malloc(sizeof(struct structHelpMenuItems));
+	if (hm && g_hmenu) RguiCommonHelp(hm, g_hmenu);
+    }
 
     setresize(g_panel, ai_resize);
     /* Closing hides: the transcript has to survive so that reopening

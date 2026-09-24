@@ -1072,6 +1072,32 @@ static void deleteselected(ConsoleData p)
 }
 
 /* cmd is in native encoding */
+/* The last maxlines lines of the console as UTF-8, for the AI
+   assistant's Attach menu.  Returns malloc'd text, or NULL.  Only reads
+   the line buffer; call it on the main thread, which is the only one
+   that writes it. */
+char *consoletailtext(console c, int maxlines)
+{
+    ConsoleData p = c ? getdata(c) : NULL;
+    if (!p || !p->lbuf || maxlines <= 0) return NULL;
+    int first = NUMLINES - maxlines;
+    if (first < 0) first = 0;
+    size_t len = 1;
+    for (int i = first; i < NUMLINES; i++) len += wcslen(LINE(i)) + 1;
+    wchar_t *w = (wchar_t *) malloc(len * sizeof(wchar_t));
+    if (!w) return NULL;
+    w[0] = L'\0';
+    for (int i = first; i < NUMLINES; i++) {
+	wcscat(w, LINE(i));
+	if (i < NUMLINES - 1) wcscat(w, L"\n");
+    }
+    int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+    char *u = n > 0 ? (char *) malloc(n) : NULL;
+    if (u) WideCharToMultiByte(CP_UTF8, 0, w, -1, u, n, NULL, NULL);
+    free(w);
+    return u;
+}
+
 void consolecmd(control c, const char *cmd)
 {
     ConsoleData p = getdata(c);

@@ -689,6 +689,8 @@
  aichat_hotkey
  aichat_shutdown
  aichat_toggle
+ editor_insert_top
+ editor_top_text
  applyGUI
  bakslv
  bincode
@@ -720,6 +722,7 @@
  consolecanpaste
  consoleclear
  consolecmd
+ consoletailtext
  consolecols
  consolecopy
  consolefg

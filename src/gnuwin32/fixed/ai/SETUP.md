@@ -73,7 +73,7 @@ say), use `rgui full` instead; it is incremental too.
 |---|---|---|
 | `rgui test` | `aichat.c` compiles warning-free with the production flags; JSON, SSE, chunked HTTP, the `<think>` filter, Stop and a missing server behave; captured real `llama-server` output parses correctly | ~10 s |
 | `rgui test -Real` | `aichat.c` starts the real `llama-server` itself, the model loads, answers with a fenced code block, and the server is stopped again | ~30 s |
-| `rgui test -Gui` | drives the built `Rgui.exe` through window messages: menu entry, panel, all buttons, hide/show/close, Copy code, To editor, R running console code **while** the model answers, the first-run download offer and the download itself, a missing model failing politely, and `llama-server` dying with Rgui | ~1–2 min |
+| `rgui test -Gui` | drives the built `Rgui.exe` through window messages: menu entry, panel, all buttons, hide/show/close, Copy code, To editor, R running console code **while** the model answers, the first-run download offer and the download itself, a missing model failing politely, the panel's full menu bar with Ctrl+T, the Attach menu, answers without code (reported, clipboard untouched), To editor into an already open script, and `llama-server` dying with Rgui | ~2–3 min |
 | `rgui test -Installer` | installs the last built setup.exe into a folder whose name has a space in it, starts RGui from the Start-menu launcher, upgrades over it (your `Rai.conf`, prompt and notes must survive) and uninstalls it (the program and model go, your `work` folder stays) | ~1 min |
 
 When something fails, the script prints the first error lines of the
@@ -133,6 +133,17 @@ without publishing; the installer is then an artifact of the run.
 The GUI tests do not run there: they need a desktop session. Run
 `rgui test -Real -Gui` here before tagging.
 
+To rehearse the whole workflow first, without pushing anything:
+
+```
+python packaging/ci-dryrun.py --pwsh <path to pwsh.exe> --rtools D:/rtools45
+```
+
+It runs every step of the build job the way GitHub's runner does (under
+PowerShell 7, from a clean copy of the last commit, in an empty build
+folder) and stops at the first failure with its log. It needs PyYAML and
+PowerShell 7; the portable PowerShell zip will do.
+
 The installer is not code-signed, so Windows SmartScreen warns the first
 time; *More info > Run anyway*.
 
@@ -176,10 +187,15 @@ No indexing step, no restart: edit a file, ask the next question.
    and keep working in R; the status line shows the progress.
 5. The status line then says `Loading the model...` for a minute or two
    the first time, then `Ready.`
-6. Ask something. Use **Copy code** or **To editor**; run the code
-   yourself.
-7. Ctrl+T again hides the panel. Ctrl+T once more brings it back with
-   the conversation intact.
+6. Ask something. **Attach** (in the panel's menu bar) adds your last
+   console error, your current script or recent console output to the
+   question, where you can edit it before sending.
+7. Use **Copy code**, or **To editor**, which inserts the code at the
+   cursor of the script you have open (Ctrl+Z undoes it) or opens a new
+   one. Answers without a code block are reported rather than copied.
+   Run the code yourself.
+8. Ctrl+T again hides the panel, also from inside it. Ctrl+T once more
+   brings it back with the conversation intact.
 
 ## 8. If something goes wrong
 
