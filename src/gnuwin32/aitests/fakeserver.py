@@ -39,6 +39,12 @@ PIECES = [
     "unicode: éá and \U0001F600 done.",
 ]
 
+# Asked something containing NOCODE, the server answers in prose only,
+# so the GUI test can check what Copy code does with an answer that has
+# no code block.
+PIECES_NOCODE = ["A p-value is the probability of data at least this ",
+                 "extreme if the null hypothesis were true."]
+
 EXPECTED = ("Use `t.test()`:\n\n```r\n"
             "t.test(len ~ supp, data = ToothGrowth)\n"
             "```\n\n"
@@ -148,7 +154,9 @@ def handle(conn):
     if REPLAY:
         raw = io.open(REPLAY, "rb").read()
     else:
-        stream = "".join(sse_record(p) for p in PIECES) + "data: [DONE]\n\n"
+        last = req["messages"][-1]["content"] if req.get("messages") else ""
+        pieces = PIECES_NOCODE if "NOCODE" in last else PIECES
+        stream = "".join(sse_record(p) for p in pieces) + "data: [DONE]\n\n"
         raw = stream.encode("utf-8")
     i, size = 0, 7
     while i < len(raw):
@@ -167,7 +175,7 @@ def main():
     srv.listen(8)
     sys.stderr.write("server: listening on %d\n" % PORT)
     sys.stderr.flush()
-    deadline = time.time() + 60
+    deadline = time.time() + 300
     while time.time() < deadline:
         srv.settimeout(2)
         try:

@@ -579,6 +579,32 @@ function Invoke-GuiTests {
     }
     if ($rc1b -ne 0) { Stop-WithError "GUI test of the first-run download ($rc1b failed checks)" }
 
+    # Pass 1c: canned answers from the fake server standing in for the
+    # model server, so the checks do not depend on what a 4B model writes.
+    Say 'GUI test, pass 1c: canned answers (no code; To editor into an open script)'
+    Stop-DevProcesses
+    $port = Get-FreePort
+    Copy-Item $conf $backup -Force
+    $srv = $null
+    try {
+        Add-Content -Path $conf -Encoding ASCII -Value @(
+            '', '## gui test overrides',
+            "port = $port",
+            'model = ai/system_prompt.txt',
+            'model_url =')
+        $srv = Start-Process -FilePath $python -ArgumentList "`"$server`"", $port `
+                             -WorkingDirectory $out -WindowStyle Hidden -PassThru
+        if (-not (Wait-Port $port 15)) { Stop-WithError "fake server did not start on port $port" }
+        $p = Start-DevRgui -NoPayload
+        & $smoke -ProcessId $p.Id -ProbeDir $probe -TreeDir $Tree -Canned
+        $rc1c = $LASTEXITCODE
+    } finally {
+        Stop-DevProcesses
+        if ($srv) { Stop-Process -Id $srv.Id -Force -ErrorAction SilentlyContinue }
+        Move-Item -Force $backup $conf
+    }
+    if ($rc1c -ne 0) { Stop-WithError "GUI test with canned answers ($rc1c failed checks)" }
+
     if (-not (Test-Path $model)) { Warn 'no model downloaded: skipping GUI pass 2'; return }
     Say 'GUI test, pass 2: real model'
     $p = Start-DevRgui

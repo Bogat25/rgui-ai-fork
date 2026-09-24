@@ -20,6 +20,10 @@ param(
     # First-run download pass: answer the offer with Yes and expect the
     # model to arrive at DownloadedModel with DownloadBytes bytes.
     [switch]$ExpectDownload,
+
+    # Canned-answer pass: the "model server" is the fake server, which
+    # answers prose for NOCODE questions and code otherwise.
+    [switch]$Canned,
     [string]$DownloadedModel = '',
     [long]$DownloadBytes = 0
 )
@@ -149,6 +153,28 @@ public static class Win {
         return sb.ToString().Replace("&", "");
     }
 
+    public static List<string> MenuNames(IntPtr bar) {
+        var l = new List<string>();
+        int n = GetMenuItemCount(bar);
+        for (int i = 0; i < n; i++) l.Add(MenuText(bar, i));
+        return l;
+    }
+    // The full label, shortcut included, of the command with this label.
+    public static string FullLabel(IntPtr bar, string label) {
+        int n = GetMenuItemCount(bar);
+        for (int i = 0; i < n; i++) {
+            IntPtr sub = GetSubMenu(bar, i);
+            if (sub == IntPtr.Zero) continue;
+            int k = GetMenuItemCount(sub);
+            for (int j = 0; j < k; j++) {
+                string t = MenuText(sub, j);
+                int tab = t.IndexOf('\t');
+                if ((tab >= 0 ? t.Substring(0, tab) : t).Trim() == label) return t;
+            }
+        }
+        return null;
+    }
+
     // Find a command by its label (the part before any tab); returns its
     // id, or -1.  topName receives the name of the top-level menu.
     public static int FindCommand(IntPtr bar, string label, out string topName) {
@@ -218,6 +244,22 @@ function Answer-Dialog([IntPtr]$Dialog, [string]$Button) {
     return (Wait-Until { -not [Win]::IsWindowVisible($Dialog) } 5)
 }
 
+function Post-Command([int]$Id) {
+    [void][Win]::PostMessageW($frame, 0x0111, [IntPtr]$Id, [IntPtr]::Zero)
+}
+
+# Script windows titled like this; the status line may quote the same
+# title, so only MDI documents count.
+function Count-Scripts([IntPtr]$Parent, [string]$Needle) {
+    $n = 0
+    foreach ($h in [Win]::Descendants($Parent)) {
+        if ([Win]::ClassOf($h) -ne 'Rgui Document') { continue }
+        $t = [Win]::Text($h)
+        if ($t -and $t.Contains($Needle)) { $n++ }
+    }
+    return $n
+}
+
 function Find-ByText([IntPtr]$Parent, [string]$Needle) {
     foreach ($h in [Win]::Descendants($Parent)) {
         $t = [Win]::Text($h)
@@ -238,9 +280,18 @@ function Test-ConsoleRuns([IntPtr]$Console, [double]$Seconds) {
     $file = Join-Path $ProbeDir ("probe{0}.txt" -f $script:ProbeSeq)
     if (Test-Path $file) { Remove-Item $file -Force }
     $rpath = $file -replace '\\', '/'
-    if (-not (Set-Clip "writeLines('ok', '$rpath')`n")) { return $false }
-    [void][Win]::PostMessageW($frame, 0x0111, [IntPtr]$script:PasteCmd, [IntPtr]::Zero)
-    return (Wait-Until { Test-Path $file } $Seconds)
+    $cmd = "writeLines('ok', '$rpath')`n"
+    # Windows' clipboard history service opens the clipboard for a moment
+    # after each change, and RGui's console Paste tries only once: give it
+    # a moment, and if R shows no sign of the input, paste again.  The
+    # check still needs R to run the code.
+    for ($attempt = 0; $attempt -lt 3; $attempt++) {
+        if (-not (Set-Clip $cmd)) { return $false }
+        Start-Sleep -Milliseconds 400
+        [void][Win]::PostMessageW($frame, 0x0111, [IntPtr]$script:PasteCmd, [IntPtr]::Zero)
+        if (Wait-Until { Test-Path $file } ($Seconds / 3)) { return $true }
+    }
+    return (Test-Path $file)
 }
 
 # ---------------------------------------------------------------------
@@ -277,7 +328,7 @@ $console = $script:console
 Check 'R Console window found' ($console -ne [IntPtr]::Zero)
 # Let R finish starting up before giving it input.
 $null = Wait-Until { [Win]::Responds($frame, 500) } 20
-Start-Sleep -Seconds 2
+Start-Sleep -Seconds 5
 $pasteTop = $null
 $script:PasteCmd = [Win]::FindCommand([Win]::GetMenu($frame), 'Paste', [ref]$pasteTop)
 Check 'console Edit > Paste command found' ($script:PasteCmd -ge 0)
@@ -320,7 +371,7 @@ Check 'transcript shows the welcome text' (([Win]::Text($hist)) -like '*Local R 
 $statusLabel = [Win]::Descendants($panel) | Where-Object { [Win]::ClassOf($_) -eq 'Rgui' } | Select-Object -First 1
 function Status { if ($statusLabel) { return [string]([Win]::Text($statusLabel)) } else { return '' } }
 
-if (-not $WithModel) {
+if (-not $WithModel -and -not $Canned) {
     # No model on disk: the first open offers to download it.
     $dlg = Wait-Dialog 10
     $offer = ''
@@ -354,6 +405,98 @@ if (-not $WithModel) {
         exit $script:Failures
     }
     Check 'answering No closes the offer' (Answer-Dialog $dlg 'No')
+}
+
+# While the panel is the active window, RGui's top bar is its menu bar.
+$bar = [Win]::GetMenu($frame)
+$names = @([Win]::MenuNames($bar))
+if (-not $Canned) {
+    foreach ($m in 'File', 'Edit', 'Attach', 'Misc', 'Packages', 'Windows', 'Help') {
+        Check ("panel menu bar has {0}" -f $m) ($names -contains $m) ("menus: " + ($names -join ', '))
+    }
+    $label = [Win]::FullLabel($bar, 'AI assistant')
+    Check 'panel Misc menu has AI assistant with its Ctrl+T' ($label -and $label.Contains('Ctrl+T')) "label: $label"
+}
+$ptop = $null
+$panelToggle = [Win]::FindCommand($bar, 'AI assistant', [ref]$ptop)
+$attErr = [Win]::FindCommand($bar, 'Last error from the console', [ref]$ptop)
+$attScript = [Win]::FindCommand($bar, 'Current script', [ref]$ptop)
+$attCon = [Win]::FindCommand($bar, 'Recent console output', [ref]$ptop)
+
+if (-not $WithModel -and -not $Canned) {
+    Post-Command $panelToggle
+    Check "the panel's own AI assistant command hides it" (Wait-Until { -not [Win]::IsWindowVisible($panel) } 5)
+    Toggle
+    $null = Wait-Until { [Win]::IsWindowVisible($panel) } 5
+
+    # Attach: a real error typed at the console.
+    if ((Set-Clip "stop('rgui-test-error')`n")) {
+        Start-Sleep -Milliseconds 400
+        Post-Command $script:PasteCmd
+        Start-Sleep -Seconds 2
+    }
+    [void][Win]::SetText($inbox, '')
+    Post-Command $attErr
+    $got = ''
+    $null = Wait-Until { $script:got = [string]([Win]::Text($inbox)); $script:got.Contains('rgui-test-error') } 5
+    Check 'Attach > Last error adds the console error' ($script:got.Contains('rgui-test-error') -and $script:got.Contains('Error')) "input: $($script:got)"
+    Check 'the attached error includes the command' ($script:got.Contains("stop('rgui-test-error')"))
+    [void][Win]::SetText($inbox, '')
+    Post-Command $attCon
+    $null = Wait-Until { ([string]([Win]::Text($inbox))).Contains('rgui-test-error') } 5
+    Check 'Attach > Recent console output adds the output' (([string]([Win]::Text($inbox))).Contains('rgui-test-error'))
+    [void][Win]::SetText($inbox, '')
+    Post-Command $attScript
+    Start-Sleep -Seconds 1
+    Check 'Attach > Current script with no script says so' `
+          (([string]([Win]::Text($inbox))) -eq '' -and (Status) -like '*No script is open*') "status: $(Status)"
+}
+
+if ($Canned) {
+    Check 'no download offer when the model file is there' ((Wait-Dialog 3) -eq [IntPtr]::Zero)
+    function Ask([string]$Q) {
+        [void][Win]::SetText($inbox, $Q)
+        [void][Win]::Click($send)
+        $null = Wait-Until { -not [Win]::IsWindowEnabled($send) } 5
+        return (Wait-Until { [Win]::IsWindowEnabled($send) } 60)
+    }
+    # An answer without a code block.
+    [void](Set-Clip 'clipboard-sentinel')
+    Check 'canned prose answer arrives' (Ask 'NOCODE: what is a p-value?')
+    Check 'it is in the transcript' (([Win]::Text($hist)).Contains('probability'))
+    [void][Win]::Click($buttons['Copy code'])
+    Check 'Copy code says the answer has no code' (Wait-Until { (Status) -like '*no code block*' } 5) "status: $(Status)"
+    Check 'and leaves the clipboard alone' ((Get-Clip) -eq 'clipboard-sentinel')
+    [void][Win]::Click($buttons['To editor'])
+    Check 'To editor says so too' (Wait-Until { (Status) -like '*no code block*' } 5) "status: $(Status)"
+    Check 'and opens no script window' ((Count-Scripts $frame 'AI answer') -eq 0)
+
+    # An answer with code: the first To editor opens a script ...
+    Check 'canned code answer arrives' (Ask 'How do I run a t-test?')
+    [void][Win]::Click($buttons['To editor'])
+    Check 'To editor opens a script when none is open' (Wait-Until { (Count-Scripts $frame 'AI answer') -ge 1 } 10)
+    # ... Attach picks it up ...
+    [void][Win]::SetText($inbox, '')
+    Post-Command $attScript
+    $null = Wait-Until { ([string]([Win]::Text($inbox))).Contains('t.test(') } 5
+    Check 'Attach > Current script adds the open script' (([string]([Win]::Text($inbox))).Contains('t.test(')) "input: $([Win]::Text($inbox))"
+    [void][Win]::SetText($inbox, '')
+    # ... and the next To editor inserts into it rather than opening another.
+    Check 'second canned code answer arrives' (Ask 'And once more, please?')
+    [void][Win]::Click($buttons['To editor'])
+    Check 'the second To editor inserts into the open script' (Wait-Until { (Status) -like '*inserted into*' } 5) "status: $(Status)"
+    Check 'no second script window' ((Count-Scripts $frame 'AI answer') -eq 1)
+    $ed = Find-ByText $frame 'AI answer'
+    $edText = (@([Win]::Descendants($ed) | ForEach-Object { [Win]::Text($_) }) -join "`n")
+    $n = ([regex]::Matches($edText, [regex]::Escape('t.test('))).Count
+    Check 'the script now holds the code twice' ($n -ge 2) "t.test( occurs $n times"
+
+    Stop-Process -Id $ProcessId -Force
+    if ($savedClipboard) { [void](Set-Clip $savedClipboard) }
+    Write-Host ''
+    if ($script:Failures -eq 0) { Write-Host 'GUI: PASSED' -ForegroundColor Green }
+    else { Write-Host ("GUI: FAILED ({0})" -f $script:Failures) -ForegroundColor Red }
+    exit $script:Failures
 }
 Check 'Send enabled, Stop disabled when idle' ([Win]::IsWindowEnabled($send) -and -not [Win]::IsWindowEnabled($stop))
 

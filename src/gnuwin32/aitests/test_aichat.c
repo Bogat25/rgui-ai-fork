@@ -20,6 +20,26 @@
 
 #include "aichat.c"
 
+/* Stubs that need types from rui.h / console.h, which aichat.c includes
+   and which have no include guards: hence after it. */
+window RConsole = NULL;
+int RguiMDI = 0;
+/* Declared by the stand-in graphapp/stdimg.h next to this file. */
+image open_image, copy_image, paste_image, stop_image, console_image;
+control GA_newtoolbar(int h) { (void)h; return STUB; }
+button  GA_newtoolbutton(image i, rect r, actionfn f) { (void)i; (void)r; (void)f; return STUB; }
+int     GA_addtooltip(control c, const char *t) { (void)c; (void)t; return 1; }
+void menueditornew(control m) { (void)m; }
+void menueditoropen(control m) { (void)m; }
+void menuconfig(control m) { (void)m; }
+int  RguiPackageMenu(PkgMenuItems p) { (void)p; return 0; }
+void pkgmenuact(PkgMenuItems p) { (void)p; }
+int  RguiCommonHelp(menu m, HelpMenuItems h) { (void)m; (void)h; return 0; }
+void helpmenuact(HelpMenuItems h) { (void)h; }
+char *consoletailtext(console c, int n) { (void)c; (void)n; return NULL; }
+char *editor_top_text(char *t, size_t n) { (void)t; (void)n; return NULL; }
+int   editor_insert_top(const char *x, char *t, size_t n) { (void)x; (void)t; (void)n; return 0; }
+
 /* ---- assertions -------------------------------------------------- */
 static int failures = 0;
 
@@ -102,12 +122,40 @@ static void test_extract_code(void)
     free(c);
 
     c = ai_extract_code("no fences here");
-    t_str("ai_extract_code: no fence falls back to all", c, "no fences here");
+    t_ok("ai_extract_code: no fenced block gives nothing", c == NULL);
     free(c);
 
     c = ai_extract_code("```r\nunterminated <- TRUE\n");
     t_str("ai_extract_code: unterminated fence", c, "unterminated <- TRUE");
     free(c);
+}
+
+static void test_find_error(void)
+{
+    const char *con =
+        "> x <- 1\n"
+        "> y <- log(-1)\n"
+        "Warning message:\n"
+        "In log(-1) : NaNs produced\n"
+        "> lm(y ~ z, data = d)\n"
+        "Error in eval(predvars, data, env) : object 'z' not found\n"
+        "> summary(x)\n"
+        "   Min. \n"
+        "> ";
+    char *e = ai_find_last_error(con);
+    t_str("attach: last error with its command", e,
+          "> lm(y ~ z, data = d)\n"
+          "Error in eval(predvars, data, env) : object 'z' not found\n");
+    free(e);
+
+    e = ai_find_last_error("> f(\n+ 1)\nError in f(1) : boom\nCalls: f -> g\n> ");
+    t_str("attach: multi-line command and Calls line", e,
+          "> f(\n+ 1)\nError in f(1) : boom\nCalls: f -> g\n");
+    free(e);
+
+    e = ai_find_last_error("> 1 + 1\n[1] 2\n> ");
+    t_ok("attach: no error in the console gives nothing", e == NULL);
+    free(e);
 }
 
 static void test_relevance(void)
@@ -451,6 +499,7 @@ int main(int argc, char **argv)
     test_json();
     test_think_filter();
     test_extract_code();
+    test_find_error();
     test_relevance();
     test_request_shape();
 
