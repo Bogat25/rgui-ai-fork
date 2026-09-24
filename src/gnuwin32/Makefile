@@ -80,7 +80,7 @@ endif
 
 dllversion-RESFLAGS = -I../include
 CSOURCES = \
-  console.c dynload.c editor.c embeddedR.c extra.c \
+  aichat.c console.c dynload.c editor.c embeddedR.c extra.c \
   opt.c pager.c preferences.c psignal.c rhome.c rt_complete.c \
   rui.c run.c shext.c sys-win32.c system.c dos_wglob.c
 OBJS = $(CSOURCES:.c=.o) dllversion.o
@@ -89,8 +89,10 @@ EXTRALIBS = getline/gl.a ../extra/xdr/libxdr.a \
    ../extra/intl/libintl.a ../extra/trio/libtrio.a ../extra/tzone/libtz.a \
    ../extra/tre/libtre.a
 
+## -lws2_32 is for aichat.c, which speaks HTTP to the local model server.
 R-DLLLIBS = $(OPENMP) -L. $(FLIBS) -lRblas -L../../$(IMPDIR) -lRgraphapp \
-  -lRiconv -lcomctl32 -lole32 -luuid -lwinmm -lversion -ldeflate $(LIBEXTRAS)
+  -lRiconv -lcomctl32 -lole32 -luuid -lwinmm -lversion -ldeflate -lws2_32 \
+  $(LIBEXTRAS)
 
 
 .PHONY:  clean veryclean rlibs fixfiles front-ends rmodules

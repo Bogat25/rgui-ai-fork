@@ -685,6 +685,10 @@
  _pcre_was_newline
  _pcre_xclass
  _vsnprintf
+ aichat_enabled
+ aichat_hotkey
+ aichat_shutdown
+ aichat_toggle
  applyGUI
  bakslv
  bincode

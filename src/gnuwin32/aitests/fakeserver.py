@@ -1,0 +1,123 @@
+"""A stand-in for llama-server that speaks the same wire protocol.
+
+Exercises the parts of aichat.c that are easy to get wrong:
+  - chunked transfer encoding, with SSE records split across chunks
+  - a <think> block whose opening and closing tags straddle chunks
+  - \\u escapes, including a surrogate pair
+  - a role-only first delta whose "content" is null
+"""
+import io, json, socket, sys, threading, time
+
+PORT = int(sys.argv[1])
+
+PIECES = [
+    None,                      # role-only chunk: "content": null
+    "<thi", "nk>", "I should use t.test here.", "</thi", "nk>",
+    "Use ", "`t.test()`", ":\n\n```r\n",
+    "t.test(len ~ supp, data = ToothGrowth)\n",
+    "```\n\n",
+    "Quotes: \"x\", backslash: \\, ",
+    "unicode: éá and \U0001F600 done.",
+]
+
+EXPECTED = ("Use `t.test()`:\n\n```r\n"
+            "t.test(len ~ supp, data = ToothGrowth)\n"
+            "```\n\n"
+            "Quotes: \"x\", backslash: \\, "
+            "unicode: éá and \U0001F600 done.")
+
+
+def sse_record(piece):
+    if piece is None:
+        delta = {"role": "assistant"}
+    else:
+        delta = {"content": piece}
+    obj = {"id": "x", "object": "chat.completion.chunk",
+           "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
+    return "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
+
+
+def chunk(data_bytes):
+    return ("%x\r\n" % len(data_bytes)).encode() + data_bytes + b"\r\n"
+
+
+def handle(conn):
+    conn.settimeout(10)
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        d = conn.recv(65536)
+        if not d:
+            conn.close()
+            return
+        buf += d
+    head, _, rest = buf.partition(b"\r\n\r\n")
+    line0 = head.split(b"\r\n")[0].decode()
+
+    if line0.startswith("GET /health"):
+        body = b'{"status":"ok"}'
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                     b"Content-Length: " + str(len(body)).encode() +
+                     b"\r\nConnection: close\r\n\r\n" + body)
+        conn.close()
+        return
+
+    if not line0.startswith("POST /v1/chat/completions"):
+        conn.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n"
+                     b"Connection: close\r\n\r\n")
+        conn.close()
+        return
+
+    # Read the request body so we can echo its length back for checking.
+    clen = 0
+    for h in head.decode(errors="replace").split("\r\n")[1:]:
+        if h.lower().startswith("content-length:"):
+            clen = int(h.split(":", 1)[1])
+    body = rest
+    while len(body) < clen:
+        d = conn.recv(65536)
+        if not d:
+            break
+        body += d
+    req = json.loads(body.decode("utf-8"))
+    sys.stderr.write("server: %d messages, system prompt %d chars\n"
+                     % (len(req["messages"]), len(req["messages"][0]["content"])))
+
+    conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                 b"Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
+
+    # Deliberately awkward framing: one byte stream cut at arbitrary
+    # points, so SSE records and even JSON tokens straddle chunks.
+    stream = "".join(sse_record(p) for p in PIECES) + "data: [DONE]\n\n"
+    raw = stream.encode("utf-8")
+    i, size = 0, 7
+    while i < len(raw):
+        conn.sendall(chunk(raw[i:i + size]))
+        i += size
+        size = 7 if size > 40 else size + 11
+        time.sleep(0.001)
+    conn.sendall(b"0\r\n\r\n")
+    conn.close()
+
+
+def main():
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", PORT))
+    srv.listen(8)
+    sys.stderr.write("server: listening on %d\n" % PORT)
+    sys.stderr.flush()
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        srv.settimeout(2)
+        try:
+            conn, _ = srv.accept()
+        except socket.timeout:
+            continue
+        threading.Thread(target=handle, args=(conn,), daemon=True).start()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 2 and sys.argv[2] == "--expected":
+        io.open("expected.txt","w",encoding="utf-8",newline="").write(EXPECTED)
+    else:
+        main()

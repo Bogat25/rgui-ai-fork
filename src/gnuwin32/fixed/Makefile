@@ -9,7 +9,7 @@ else
   LOCAL_SOFT := $(abspath $(LOCAL_SOFT))
 endif
 
-all: profiles fixhtml fixetc fixdoc svnonly
+all: profiles fixhtml fixetc fixai fixdoc svnonly
 
 profiles: $(R_HOME)/library/base/R/Rprofile
 
@@ -55,6 +55,16 @@ fixetc: $(ETC) ../MkRules Makefile
 	   Makeconf > $(R_HOME)/Makeconf
 	@$(ECHO) done > fixetc
 
+## Templates for the AI assistant (see etc/Rai.conf).  The model and
+## llama-server.exe are not shipped; these just create the layout and
+## the default prompt, and never overwrite a file the user has edited.
+fixai:
+	-$(MKDIR) -p $(R_HOME)/ai/context $(R_HOME)/ai/models $(R_HOME)/ai/llama
+	-test -f $(R_HOME)/ai/system_prompt.txt || $(CP) -p ai/system_prompt.txt $(R_HOME)/ai
+	-test -f $(R_HOME)/ai/context/README.txt || $(CP) -p ai/context/README.txt $(R_HOME)/ai/context
+	-$(CP) -p ai/SETUP.md ai/Start-R.cmd $(R_HOME)/ai
+	@$(ECHO) done > fixai
+
 fixdoc: $(wildcard ../CHANGES?)
 	$(CP) -p $^ $(R_HOME)/doc
 	@$(ECHO) done > fixdoc
@@ -63,7 +73,7 @@ svnonly:
 	@$(MAKE) -C ../../../doc/manual -f Makefile.win svnonly
 
 clean:
-	$(RM) *~ */*~ fixhtml fixbin fixetc fixshare fixdoc
+	$(RM) *~ */*~ fixhtml fixbin fixetc fixai fixshare fixdoc
 
 distclean:
 	$(RM) $(R_HOME)/doc/CHANGES* $(R_HOME)/Makeconf

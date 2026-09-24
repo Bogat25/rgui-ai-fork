@@ -40,6 +40,7 @@
 #include "console.h"
 #include "rui.h"
 #include "preferences.h"
+#include "aichat.h"
 #include <Rversion.h>
 #include "getline/wc_history.h"  /* for wgl_load/savehistory */
 #include <Startup.h>          /* for SA_DEFAULT */
@@ -509,6 +510,11 @@ void breaktodebugger(void)
 static void menudebug(control m)
 {
     breaktodebugger();
+}
+
+static void menuaichat(control m)
+{
+    aichat_toggle();
 }
 
 static void menuls(control m)
@@ -1267,6 +1273,10 @@ int setupui(void)
     MCHECK(mls = newmenuitem(G_("List objects"), 0, menuls));
     MCHECK(mrm = newmenuitem(G_("Remove all objects"), 0, menurm));
     MCHECK(msearch = newmenuitem(G_("List search &path"), 0, menusearch));
+    if (aichat_enabled()) {
+	MCHECK(newmenuitem("-", 0, NULL));
+	MCHECK(newmenuitem(G_("AI assistant"), aichat_hotkey(), menuaichat));
+    }
 
     pmenu = (PkgMenuItems) malloc(sizeof(struct structPkgMenuItems));
     RguiPackageMenu(pmenu);

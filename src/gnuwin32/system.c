@@ -33,6 +33,7 @@
 #include "rui.h"
 #include "editor.h"
 #include "getline/getline.h"
+#include "aichat.h"
 #include "getline/wc_history.h"
 #define WIN32_LEAN_AND_MEAN 1
 #include <windows.h>		/* for CreateEvent,.. */
@@ -637,6 +638,7 @@ static void Rstd_CleanUp(SA_TYPE saveact, int status, int runLast)
     default:
 	break;
     }
+    aichat_shutdown();
     R_RunExitFinalizers();
     editorcleanall();
     CleanEd();
