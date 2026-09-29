@@ -867,6 +867,9 @@ function Invoke-Package {
 function Resolve-Version {
     $v = $Version
     if (-not $v) {
+        # No tag on HEAD is normal; git says so on stderr, which Windows
+        # PowerShell 5.1 would turn into a terminating error under 'Stop'.
+        $ErrorActionPreference = 'Continue'   # this function's scope only
         $tag = (& git -C $Repo describe --tags --exact-match 2>$null)
         if ($LASTEXITCODE -eq 0 -and $tag) { $v = "$tag".Trim() } else { $v = '0.0.0-dev' }
     }
