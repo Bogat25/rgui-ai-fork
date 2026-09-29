@@ -71,9 +71,9 @@ say), use `rgui full` instead; it is incremental too.
 
 | Command | What it proves | Time |
 |---|---|---|
-| `rgui test` | `aichat.c` compiles warning-free with the production flags; JSON, SSE, chunked HTTP, the `<think>` filter, Stop and a missing server behave; captured real `llama-server` output parses correctly | ~10 s |
+| `rgui test` | `aichat.c` compiles warning-free with the production flags; JSON, SSE, chunked HTTP, the `<think>` filter, Stop and a missing server behave; captured real `llama-server` output parses correctly; on real RichEdit controls, Markdown renders without its markup, emoji and characters Consolas lacks get fonts that have them, and typed or set text in any script arrives whole | ~10 s |
 | `rgui test -Real` | `aichat.c` starts the real `llama-server` itself, the model loads, answers with a fenced code block, and the server is stopped again | ~30 s |
-| `rgui test -Gui` | drives the built `Rgui.exe` through window messages: menu entry, panel, all buttons, hide/show/close, Copy code, To editor, R running console code **while** the model answers, the first-run download offer and the download itself, a missing model failing politely, the panel's full menu bar with Ctrl+T, the Attach menu, answers without code (reported, clipboard untouched), To editor into an already open script, and `llama-server` dying with Rgui | ~2–3 min |
+| `rgui test -Gui` | drives the built `Rgui.exe` through window messages: menu entry, panel, all buttons, hide/show/close, Copy code, To editor, R running console code **while** the model answers, the first-run download offer and the download itself, a missing model failing politely, the panel's full menu bar with Ctrl+T, the Attach menu, answers without code (reported, clipboard untouched), To editor into an already open script, a question in Hungarian, Greek, Chinese and emoji reaching the transcript unchanged, answers shown without their Markdown code fences, and `llama-server` dying with Rgui | ~2–3 min |
 | `rgui test -Installer` | installs the last built setup.exe into a folder whose name has a space in it, starts RGui from the Start-menu launcher, upgrades over it (your `Rai.conf`, prompt and notes must survive) and uninstalls it (the program and model go, your `work` folder stays) | ~1 min |
 
 When something fails, the script prints the first error lines of the
@@ -187,7 +187,11 @@ No indexing step, no restart: edit a file, ask the next question.
    and keep working in R; the status line shows the progress.
 5. The status line then says `Loading the model...` for a minute or two
    the first time, then `Ready.`
-6. Ask something. **Attach** (in the panel's menu bar) adds your last
+6. Ask something, in any language: accents, Greek, maths symbols,
+   Chinese and emoji all type, paste and display. Answers appear
+   formatted as they arrive: code in grey boxes, `inline code`, bold,
+   bullets. Pasting into the question box always pastes plain text.
+   **Attach** (in the panel's menu bar) adds your last
    console error, your current script or recent console output to the
    question, where you can edit it before sending.
 7. Use **Copy code**, or **To editor**, which inserts the code at the

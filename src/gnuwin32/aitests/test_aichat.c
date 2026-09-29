@@ -39,6 +39,8 @@ void helpmenuact(HelpMenuItems h) { (void)h; }
 char *consoletailtext(console c, int n) { (void)c; (void)n; return NULL; }
 char *editor_top_text(char *t, size_t n) { (void)t; (void)n; return NULL; }
 int   editor_insert_top(const char *x, char *t, size_t n) { (void)x; (void)t; (void)n; return 0; }
+textbox GA_newrichtextarea(const char *t, rect r) { (void)t; (void)r; return STUB; }
+int pointsize = 10;
 
 /* ---- assertions -------------------------------------------------- */
 static int failures = 0;
@@ -128,6 +130,178 @@ static void test_extract_code(void)
     c = ai_extract_code("```r\nunterminated <- TRUE\n");
     t_str("ai_extract_code: unterminated fence", c, "unterminated <- TRUE");
     free(c);
+}
+
+/* ---- the transcript, on a real RichEdit control ------------------- */
+
+/* Face name (UTF-8) and effects of the character at pos. */
+static const char *face_at(HWND h, LONG pos, DWORD *effects)
+{
+    static char u8[LF_FACESIZE * 3];
+    CHARFORMAT2W cf;
+    memset(&cf, 0, sizeof cf);
+    cf.cbSize = sizeof cf;
+    re_select(h, pos, pos + 1);
+    SendMessage(h, EM_GETCHARFORMAT, SCF_SELECTION, (LPARAM) &cf);
+    WideCharToMultiByte(CP_UTF8, 0, cf.szFaceName, -1, u8, sizeof u8, NULL, NULL);
+    if (effects) *effects = cf.dwEffects;
+    return u8;
+}
+
+/* Position of the first occurrence of u8 in the control's text. */
+static LONG pos_of(HWND h, const char *u8)
+{
+    wchar_t *w = u8_to_wcs(u8);
+    LONG n = re_length(h);
+    wchar_t *all = (wchar_t *) calloc((size_t) n + 2, sizeof(wchar_t));
+    GETTEXTEX gt;
+    memset(&gt, 0, sizeof gt);
+    gt.cb = (DWORD) (((size_t) n + 1) * sizeof(wchar_t));
+    gt.flags = GT_DEFAULT;             /* paragraphs as \r, one position each */
+    gt.codepage = AI_CP_UTF16;
+    SendMessage(h, EM_GETTEXTEX, (WPARAM) &gt, (LPARAM) all);
+    wchar_t *at = w ? wcsstr(all, w) : NULL;
+    LONG r = at ? (LONG) (at - all) : -1;
+    free(all);
+    free(w);
+    return r;
+}
+
+static void test_transcript(void)
+{
+    LoadLibraryA("riched20.dll");
+    HWND h = CreateWindowExW(0, L"RichEdit20W", L"", WS_POPUP | ES_MULTILINE,
+                             0, 0, 400, 300, NULL, NULL, GetModuleHandle(NULL), NULL);
+    t_ok("transcript: RichEdit control created", h != NULL);
+    if (!h) return;
+    re_setup(h);
+    SendMessage(h, EM_SETREADONLY, TRUE, 0);
+
+    const char *emoji = "\xf0\x9f\x98\x80";            /* U+1F600 */
+    const char *question = "\xc3\x81rv\xc3\xadzt\xc5\xb1r\xc5\x91 \xe2\x89\xa4 "
+                           "\xe4\xb8\xad\xe6\x96\x87 \xe2\x80\x93 \xf0\x9f\x98\x80";
+
+    /* What ai_do_send and the stream do, in order. */
+    tr_block(h, "Welcome.\n\n", TF_NOTE);
+    tr_begin(h);
+    tr_add(h, "You\n", TF_YOU);
+    tr_add(h, question, TF_TEXT);
+    tr_add(h, "\n\n", TF_TEXT);
+    tr_add(h, "R assistant\n", TF_BOT);
+    tr_end(h);
+    md_begin(h);
+    const char *answer[] = {
+        "Use **t.te", "st()** with `var.equal", " = TRUE`:\n\n```r\nt.test(len ~ supp",
+        ", data = ToothGrowth)\n```\n\n- first\n- sec", "ond *point*\n\nAnd 2 * 3 is 6, ",
+        "and ", emoji, " done.", NULL };
+    for (int i = 0; answer[i]; i++) md_feed(h, answer[i], 0);
+    md_feed(h, "", 1);
+
+    char *text = re_get_u8(h);
+    dynbuf want;
+    db_init(&want);
+    db_add(&want, "Welcome.\n\nYou\n");
+    db_add(&want, question);
+    db_add(&want, "\n\nR assistant\nUse t.test() with var.equal = TRUE:\n\n"
+                  "t.test(len ~ supp, data = ToothGrowth)\n\n"
+                  "\xe2\x80\xa2 first\n\xe2\x80\xa2 second point\n\n"
+                  "And 2 * 3 is 6, and ");
+    db_add(&want, emoji);
+    db_add(&want, " done.\n");
+    t_str("transcript: Markdown shown without its markup", text, want.s);
+    db_free(&want);
+    free(text);
+
+    DWORD fx = 0;
+    LONG p = pos_of(h, "t.test()");
+    t_str("transcript: **bold** is bold", face_at(h, p, &fx), "Segoe UI");
+    t_ok("transcript: **bold** is bold (effect)", (fx & CFE_BOLD) != 0);
+    p = pos_of(h, "var.equal");
+    t_str("transcript: `inline code` in Consolas", face_at(h, p, NULL), "Consolas");
+    p = pos_of(h, "t.test(len");
+    t_str("transcript: code block in Consolas", face_at(h, p, NULL), "Consolas");
+    p = pos_of(h, "point");
+    face_at(h, p, &fx);
+    t_ok("transcript: *italic* is italic", (fx & CFE_ITALIC) != 0);
+    p = pos_of(h, "2 * 3");
+    face_at(h, p, &fx);
+    t_ok("transcript: 2 * 3 is not italic", (fx & CFE_ITALIC) == 0);
+
+    p = pos_of(h, question);
+    wchar_t *wq = u8_to_wcs(question);
+    LONG qe = p + (LONG) wcslen(wq) - 2;               /* the emoji's first half */
+    free(wq);
+    t_str("transcript: question text in Segoe UI", face_at(h, p, NULL), "Segoe UI");
+    t_str("transcript: emoji in the question has an emoji font",
+          face_at(h, qe, NULL), "Segoe UI Emoji");
+    /* RichEdit's font binding would put these in SimSun after Chinese. */
+    t_str("transcript: text after Chinese stays in Segoe UI",
+          face_at(h, qe - 1, NULL), "Segoe UI");
+    t_str("transcript: emoji in the answer has an emoji font",
+          face_at(h, pos_of(h, " done.") - 2, NULL), "Segoe UI Emoji");
+    t_str("transcript: text after it is back in Segoe UI",
+          face_at(h, pos_of(h, " done.") + 1, NULL), "Segoe UI");
+
+    /* Consolas has no Chinese and no check mark: code borrows Segoe UI. */
+    tr_add(h, "y <- 2 # \xe4\xb8\xad\xe6\x96\x87 \xe2\x9c\x93\n", TF_CODE);
+    t_str("transcript: code stays in Consolas",
+          face_at(h, pos_of(h, "y <- 2"), NULL), "Consolas");
+    t_str("transcript: Chinese in code falls back to Segoe UI",
+          face_at(h, pos_of(h, "\xe6\x96\x87"), NULL), "Segoe UI");
+    t_str("transcript: a check mark in code falls back too",
+          face_at(h, pos_of(h, "\xe2\x9c\x93"), NULL), "Segoe UI");
+    t_str("transcript: the space between them stays Consolas",
+          face_at(h, pos_of(h, "\xe2\x9c\x93") - 1, NULL), "Consolas");
+
+    DestroyWindow(h);
+}
+
+/* The question box, with the panel's window procedure on it. */
+static void test_question_box(void)
+{
+    HWND h = CreateWindowExW(0, L"RichEdit20W", L"", WS_POPUP | ES_MULTILINE,
+                             0, 0, 400, 100, NULL, NULL, GetModuleHandle(NULL), NULL);
+    t_ok("question box: RichEdit control created", h != NULL);
+    if (!h) return;
+    in_setup(h);
+    g_hinput = h;
+    g_re_proc = (WNDPROC) GetClassLongPtrW(h, GCLP_WNDPROC);
+    g_prev_input = g_re_proc;
+    SetWindowLongPtrW(h, GWLP_WNDPROC, (LONG_PTR) ai_box_proc);
+
+    /* set from outside, as Windows would pass it: UTF-16 */
+    SendMessageW(h, WM_SETTEXT, 0, (LPARAM) L"ab \xD83D\xDE00 \x4E2D");
+    char *t = re_get_u8(h);
+    t_str("question box: set text arrives whole", t,
+          "ab \xf0\x9f\x98\x80 \xe4\xb8\xad");
+    free(t);
+    t_str("question box: set text in Segoe UI", face_at(h, 0, NULL), "Segoe UI");
+    t_str("question box: set emoji in the emoji font", face_at(h, 3, NULL), "Segoe UI Emoji");
+    t_str("question box: text after it back in Segoe UI", face_at(h, 6, NULL), "Segoe UI");
+
+    /* typed: a key, then the characters it produced, as TranslateMessage
+       leaves them in the queue */
+    LONG n = re_length(h);
+    re_select(h, n, n);
+    const wchar_t typed[] = L" x\xD83D\xDE00y\x0151";
+    PostMessageW(h, WM_KEYDOWN, VK_F24, 1);
+    for (const wchar_t *q = typed; *q; q++) PostMessageW(h, WM_CHAR, *q, 1);
+    MSG m;
+    while (PeekMessageW(&m, h, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&m);
+        DispatchMessageW(&m);
+    }
+    t = re_get_u8(h);
+    t_str("question box: typed characters arrive whole", t,
+          "ab \xf0\x9f\x98\x80 \xe4\xb8\xad x\xf0\x9f\x98\x80y\xc5\x91");
+    free(t);
+    t_str("question box: typed letter in Segoe UI", face_at(h, n + 1, NULL), "Segoe UI");
+    t_str("question box: typed emoji in the emoji font", face_at(h, n + 2, NULL), "Segoe UI Emoji");
+    t_str("question box: letter typed after it in Segoe UI", face_at(h, n + 4, NULL), "Segoe UI");
+    t_ok("question box: typing can be undone", SendMessage(h, EM_CANUNDO, 0, 0) != 0);
+
+    g_hinput = NULL;
+    DestroyWindow(h);
 }
 
 static void test_find_error(void)
@@ -502,6 +676,8 @@ int main(int argc, char **argv)
     test_find_error();
     test_relevance();
     test_request_shape();
+    test_transcript();
+    test_question_box();
 
     if (argc > 2) {
         /* argv[1] = port, argv[2] = file holding the expected answer */

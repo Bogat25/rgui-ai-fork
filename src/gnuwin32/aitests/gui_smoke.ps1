@@ -110,16 +110,14 @@ public static class Win {
         IntPtr r; return SmtoInt(h, 0, IntPtr.Zero, IntPtr.Zero, SMTO_ABORTIFHUNG, ms, out r) != IntPtr.Zero;
     }
 
-    // The transcript is an ANSI edit control.  Sent through the W entry
-    // point, EM_GETSEL comes back mangled by the system's A/W position
-    // translation; through the A entry point it round-trips exactly.
-    [DllImport("user32.dll", EntryPoint = "SendMessageTimeoutA")]
-    static extern IntPtr SmtoA(IntPtr h, uint m, IntPtr w, IntPtr l, uint f, uint t, out IntPtr r);
+    // The chat boxes are Unicode windows (the panel puts a W procedure on
+    // top of GraphApp's), so EM_SETSEL / EM_GETSEL go through the W entry
+    // point and the positions arrive untranslated.
     public static void SetSel(IntPtr h, int a, int b) {
-        IntPtr r; SmtoA(h, 0x00B1, (IntPtr) a, (IntPtr) b, SMTO_ABORTIFHUNG, 5000, out r);
+        IntPtr r; SmtoInt(h, 0x00B1, (IntPtr) a, (IntPtr) b, SMTO_ABORTIFHUNG, 5000, out r);
     }
     public static int[] GetSel(IntPtr h) {
-        IntPtr r; SmtoA(h, 0x00B0, IntPtr.Zero, IntPtr.Zero, SMTO_ABORTIFHUNG, 5000, out r);
+        IntPtr r; SmtoInt(h, 0x00B0, IntPtr.Zero, IntPtr.Zero, SMTO_ABORTIFHUNG, 5000, out r);
         long v = (long) r;
         return new int[] { (int) (v & 0xFFFF), (int) ((v >> 16) & 0xFFFF) };
     }
@@ -354,7 +352,7 @@ if ($panel -eq [IntPtr]::Zero) { exit 97 }
 $edits = @(); $buttons = @{}
 foreach ($h in [Win]::Descendants($panel)) {
     $cls = [Win]::ClassOf($h)
-    if ($cls -ieq 'Edit') { $edits += $h }
+    if ($cls -match 'Edit') { $edits += $h }            # RichEdit20W
     elseif ($cls -ieq 'Button') { $buttons[[Win]::Text($h)] = $h }
 }
 $hist = $edits | Where-Object { ([Win]::Style($_) -band 0x0800) -ne 0 } | Select-Object -First 1   # ES_READONLY
@@ -471,8 +469,20 @@ if ($Canned) {
     Check 'To editor says so too' (Wait-Until { (Status) -like '*no code block*' } 5) "status: $(Status)"
     Check 'and opens no script window' ((Count-Scripts $frame 'AI answer') -eq 0)
 
+    # Every character: set into the box, sent, shown; and Markdown rendered.
+    # (escapes: this file is read as ANSI by Windows PowerShell 5.1)
+    $uq = [regex]::Unescape('\u00c1rv\u00edzt\u0171r\u0151 t\u00fck\u00f6rf\u00far\u00f3g\u00e9p \u2013 ' +
+          '\u03b1\u03b2\u03b3 \u2264 \u2265 \u2211 \u2013 \u4e2d\u6587 \u2013 \ud83d\ude00 \u2013 t-test?')
+    [void][Win]::SetText($inbox, $uq)
+    Check 'a question in any script round-trips through the input box' ([Win]::Text($inbox) -eq $uq)
+
     # An answer with code: the first To editor opens a script ...
-    Check 'canned code answer arrives' (Ask 'How do I run a t-test?')
+    Check 'canned code answer arrives' (Ask $uq)
+    $ht = [string]([Win]::Text($hist))
+    Check 'the question reaches the transcript whole' ($ht.Contains($uq))
+    Check "the answer's accents and emoji reach the transcript" ($ht.Contains([regex]::Unescape('\u00e9\u00e1 and \ud83d\ude00')))
+    Check 'the answer is rendered: no raw ``` or backticks' (-not $ht.Contains('```') -and -not $ht.Contains('`t.test()`'))
+    Check 'the code block is shown' ($ht.Contains('t.test(len ~ supp, data = ToothGrowth)'))
     [void][Win]::Click($buttons['To editor'])
     Check 'To editor opens a script when none is open' (Wait-Until { (Count-Scripts $frame 'AI answer') -ge 1 } 10)
     # ... Attach picks it up ...
@@ -538,12 +548,12 @@ if ($WithModel) {
     Check "the answer completes within $AnswerTimeout s" $done
     $text = [Win]::Text($hist)
     $reply = ''
-    $at = $text.LastIndexOf('R assistant:')
-    if ($at -ge 0) { $reply = $text.Substring($at + 12).Trim() }
+    $at = $text.LastIndexOf('R assistant')
+    if ($at -ge 0) { $reply = $text.Substring($at + 11).Trim() }
     Check 'transcript has the question' ($text.Contains($question))
     Check 'transcript has a non-empty answer' ($reply.Length -gt 0) "transcript tail: $($text.Substring([Math]::Max(0, $text.Length - 300)))"
     Check 'answer contains mean(' ($reply.Contains('mean('))
-    Check 'answer has a fenced code block' ($reply.Contains('```'))
+    Check 'the code is shown without its ``` fences' ($reply.Contains('mean(') -and -not $reply.Contains('```'))
     Check 'no <think> text in the transcript' (-not $text.Contains('<think>'))
 
     [void](Set-Clip 'clipboard-before')
@@ -569,9 +579,9 @@ if ($WithModel) {
     $null = Wait-Until { -not [Win]::IsWindowEnabled($send) } 10
     $done2 = Wait-Until { [Win]::IsWindowEnabled($send) } $AnswerTimeout
     $text2 = [Win]::Text($hist)
-    $at2 = $text2.LastIndexOf('R assistant:')
+    $at2 = $text2.LastIndexOf('R assistant')
     $reply2 = ''
-    if ($at2 -ge 0) { $reply2 = $text2.Substring($at2 + 12).Trim() }
+    if ($at2 -ge 0) { $reply2 = $text2.Substring($at2 + 11).Trim() }
     $sel = [Win]::GetSel($hist)
     Check 'second answer completes' $done2
     Check 'second answer lands after its header' ($reply2.Contains('median')) "reply: $reply2"

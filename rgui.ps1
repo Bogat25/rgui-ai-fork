@@ -673,7 +673,7 @@ function Invoke-Test {
 
     Say 'building the test harness'
     $sh = "cd $t/src/gnuwin32/aitests && " +
-              "gcc -O1 -g -I. -I.. $cflags test_aichat.c -o $o/test_aichat.exe -lws2_32 -lwinhttp -lbcrypt"
+              "gcc -O1 -g -I. -I.. $cflags test_aichat.c -o $o/test_aichat.exe -lws2_32 -lwinhttp -lbcrypt -lgdi32"
     if ((Invoke-Bash $sh 'test-build') -ne 0) { Stop-WithError 'test harness build' }
     $exe = Join-Path $out 'test_aichat.exe'
 

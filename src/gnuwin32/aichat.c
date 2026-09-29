@@ -68,6 +68,7 @@
 #include <windows.h>
 #include <process.h>
 #include <winhttp.h>
+#include <richedit.h>
 #include <bcrypt.h>
 
 #ifndef WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY
@@ -103,6 +104,8 @@ static void db_init(dynbuf *b)
 
 static int db_reserve(dynbuf *b, size_t extra)
 {
+    const size_t half = ((size_t) -1) / 4;   /* sums below cannot wrap */
+    if (extra > half || b->n > half) return 0;
     size_t need = b->n + extra + 1;
     if (need <= b->cap) return 1;
     size_t cap = b->cap ? b->cap : 256;
@@ -1760,86 +1763,575 @@ static HWND    g_hhist   = NULL, g_hinput = NULL;
 static dynbuf  g_reply;                  /* assistant text of this turn */
 static int     g_reply_open = 0;
 
-/* --- Win32 EDIT helpers; UTF-8 in and out whatever the window type -- */
+static const char AI_WELCOME[] =
+    "Local R assistant.\r\n"
+    "Type a question below and press Send (or Ctrl+Enter). The Attach "
+    "menu adds your last error, your script or recent console output.\r\n"
+    "Copy code puts the code from the last answer on the clipboard; "
+    "To editor puts it into your open script, or a new one. Nothing is "
+    "run for you.\r\n"
+    "Nothing leaves this computer.\r\n"
+    "\r\n";
 
-static void edit_send_text(HWND h, UINT msg, WPARAM wp, const char *u8)
+/* --- RichEdit helpers: UTF-8 in and out, every character ------------ */
+
+/* Both chat boxes are RichEdit controls, and text goes in and out as
+   UTF-16 through RichEdit's own EM_SETTEXTEX / EM_GETTEXTEX (code page
+   1200).  The generic edit messages would pass through GraphApp's ANSI
+   subclass and a code-page conversion on the way; with the plain EDIT
+   boxes this used, a question lost everything after its first few
+   non-Latin characters. */
+
+#define AI_CP_UTF16 1200
+
+/* Number of character positions, in the units EM_EXSETSEL uses. */
+static LONG re_length(HWND h)
 {
-    wchar_t *w = u8_to_wcs(u8);
+    GETTEXTLENGTHEX g;
+    g.flags = GTL_NUMCHARS | GTL_PRECISE;
+    g.codepage = AI_CP_UTF16;
+    LRESULT n = SendMessage(h, EM_GETTEXTLENGTHEX, (WPARAM) &g, 0);
+    return n < 0 ? 0 : (LONG) n;
+}
+
+static void re_select(HWND h, LONG from, LONG to)
+{
+    CHARRANGE cr;
+    cr.cpMin = from;
+    cr.cpMax = to;
+    SendMessage(h, EM_EXSETSEL, 0, (LPARAM) &cr);
+}
+
+/* Replace the selection with UTF-8 text; \n becomes a paragraph break. */
+static void re_replace_sel(HWND h, const char *u8)
+{
+    dynbuf t;
+    db_init(&t);
+    for (const char *q = u8; *q; q++) {
+	if (*q == '\r') continue;
+	db_addc(&t, *q == '\n' ? '\r' : *q);
+    }
+    wchar_t *w = u8_to_wcs(t.s ? t.s : "");
+    db_free(&t);
     if (!w) return;
-    if (IsWindowUnicode(h))
-	SendMessageW(h, msg, wp, (LPARAM) w);
-    else {
-	int n = WideCharToMultiByte(CP_ACP, 0, w, -1, NULL, 0, NULL, NULL);
-	char *a = n > 0 ? (char *) malloc((size_t) n) : NULL;
-	if (a && WideCharToMultiByte(CP_ACP, 0, w, -1, a, n, NULL, NULL) > 0)
-	    SendMessageA(h, msg, wp, (LPARAM) a);
-	free(a);
+    if (!wcsncmp(w, L"{\\rtf", 5) || !wcsncmp(w, L"{urtf", 5)) {
+	/* EM_SETTEXTEX would read this as RTF; the plain route keeps it text. */
+	SendMessageW(h, EM_REPLACESEL, FALSE, (LPARAM) w);
+    } else {
+	SETTEXTEX st;
+	st.flags = ST_SELECTION;
+	st.codepage = AI_CP_UTF16;
+	SendMessage(h, EM_SETTEXTEX, (WPARAM) &st, (LPARAM) w);
     }
     free(w);
 }
 
-static void edit_append_u8(HWND h, const char *u8)
-{
-    if (!h || !u8 || !*u8) return;
-    dynbuf t; db_init(&t);
-    for (const char *p = u8; *p; p++) {
-	if (*p == '\r') continue;
-	if (*p == '\n') db_add(&t, "\r\n"); else db_addc(&t, *p);
-    }
-    LONG style = GetWindowLong(h, GWL_STYLE);
-    int ro = (style & ES_READONLY) != 0;
-
-    /* EM_REPLACESEL inserts at the caret, so the caret has to be put at
-       the end first.  EM_SETSEL(-1, -1) does not do that -- it only
-       drops the selection and leaves the caret where the user last
-       clicked, which spliced streamed text into the middle of the
-       transcript.  An ANSI control reports its length in bytes, which
-       can only overshoot the end, and the control clamps that. */
-    DWORD sel0 = 0, sel1 = 0;
-    SendMessage(h, EM_GETSEL, (WPARAM) &sel0, (LPARAM) &sel1);
-    int user_selection = sel0 != sel1;
-    LRESULT end = IsWindowUnicode(h) ? GetWindowTextLengthW(h)
-				     : GetWindowTextLengthA(h);
-
-    if (ro) SendMessage(h, EM_SETREADONLY, FALSE, 0);
-    SendMessage(h, EM_SETSEL, (WPARAM) end, (LPARAM) end);
-    edit_send_text(h, EM_REPLACESEL, FALSE, t.s ? t.s : "");
-    if (ro) SendMessage(h, EM_SETREADONLY, TRUE, 0);
-
-    if (user_selection)
-	/* The user is selecting text, perhaps to copy it: leave that
-	   alone and do not scroll away from it. */
-	SendMessage(h, EM_SETSEL, (WPARAM) sel0, (LPARAM) sel1);
-    else
-	SendMessage(h, EM_SCROLLCARET, 0, 0);
-    db_free(&t);
-}
-
-/* Returns malloc'd UTF-8 with CRLF folded to LF, or NULL. */
-static char *edit_get_u8(HWND h)
+/* The whole text as UTF-8 with \n line ends (malloc'd), or NULL. */
+static char *re_get_u8(HWND h)
 {
     if (!h) return NULL;
-    int len = GetWindowTextLengthW(h);
-    wchar_t *w = (wchar_t *) malloc(((size_t) len + 2) * sizeof(wchar_t));
+    GETTEXTLENGTHEX gl;
+    gl.flags = GTL_NUMCHARS | GTL_PRECISE | GTL_USECRLF;
+    gl.codepage = AI_CP_UTF16;
+    LRESULT n = SendMessage(h, EM_GETTEXTLENGTHEX, (WPARAM) &gl, 0);
+    if (n < 0) n = 0;
+    wchar_t *w = (wchar_t *) calloc((size_t) n + 2, sizeof(wchar_t));
     if (!w) return NULL;
-    GetWindowTextW(h, w, len + 1);
+    GETTEXTEX gt;
+    memset(&gt, 0, sizeof gt);
+    gt.cb = (DWORD) (((size_t) n + 1) * sizeof(wchar_t));
+    gt.flags = GT_DEFAULT;
+    gt.codepage = AI_CP_UTF16;
+    SendMessage(h, EM_GETTEXTEX, (WPARAM) &gt, (LPARAM) w);
     char *u8 = wcs_to_u8(w);
     free(w);
     if (!u8) return NULL;
     char *d = u8;
-    for (char *s = u8; *s; s++) if (*s != '\r') *d++ = *s;
+    for (char *q = u8; *q; q++) {
+	if (*q == '\r') { *d++ = '\n'; if (q[1] == '\n') q++; }
+	else *d++ = *q;
+    }
     *d = '\0';
     return u8;
+}
+
+static char *edit_get_u8(HWND h) { return re_get_u8(h); }
+
+static void in_refont(HWND h, LONG from, LONG to);
+
+/* Append UTF-8 text at the end of an editable box (the question box). */
+static void edit_append_u8(HWND h, const char *u8)
+{
+    if (!h || !u8 || !*u8) return;
+    LONG n = re_length(h);
+    re_select(h, n, n);
+    re_replace_sel(h, u8);
+    in_refont(h, n, re_length(h));
+    n = re_length(h);
+    re_select(h, n, n);
+    SendMessage(h, EM_SCROLLCARET, 0, 0);
 }
 
 static void edit_clear(HWND h)
 {
     if (!h) return;
-    LONG style = GetWindowLong(h, GWL_STYLE);
-    int ro = (style & ES_READONLY) != 0;
+    LRESULT ro = GetWindowLong(h, GWL_STYLE) & ES_READONLY;
     if (ro) SendMessage(h, EM_SETREADONLY, FALSE, 0);
-    SetWindowTextW(h, L"");
+    SETTEXTEX st;
+    st.flags = ST_DEFAULT;
+    st.codepage = AI_CP_UTF16;
+    SendMessage(h, EM_SETTEXTEX, (WPARAM) &st, (LPARAM) L"");
     if (ro) SendMessage(h, EM_SETREADONLY, TRUE, 0);
+}
+
+/* --- the transcript: Markdown, rendered as it streams --------------- */
+
+/* The model answers in Markdown.  The transcript shows it formatted --
+   prose in a proportional font that wraps, code blocks in Consolas on a
+   grey background without their ``` fences, **bold**, `inline code`,
+   bullets and headings -- while g_reply keeps the raw text for Copy code
+   and To editor.  A line is shown as it arrives and re-rendered with its
+   formatting once it is complete. */
+
+typedef enum { TF_TEXT, TF_BOLD, TF_ITALIC, TF_CODE, TF_INLINE,
+	       TF_YOU, TF_BOT, TF_NOTE } tfmt;
+
+extern int pointsize;                /* console font size, console.c */
+
+static int tr_points(void)
+{
+    if (CFG.font_points > 0) return CFG.font_points;
+    return (pointsize >= 6 && pointsize <= 36) ? pointsize : 10;
+}
+
+static void tr_format(HWND h, LONG from, LONG to, tfmt f)
+{
+    CHARFORMAT2W cf;
+    memset(&cf, 0, sizeof cf);
+    cf.cbSize = sizeof cf;
+    cf.dwMask = CFM_FACE | CFM_SIZE | CFM_BOLD | CFM_ITALIC | CFM_COLOR |
+		CFM_BACKCOLOR | CFM_CHARSET;
+    cf.bCharSet = DEFAULT_CHARSET;
+    cf.yHeight = tr_points() * 20;
+    const wchar_t *face = L"Segoe UI";
+    COLORREF color = RGB(0x1f, 0x1f, 0x1f);
+    int bold = 0, italic = 0, shaded = 0;
+    switch (f) {
+    case TF_TEXT: break;
+    case TF_BOLD: bold = 1; break;
+    case TF_ITALIC: italic = 1; break;
+    case TF_CODE: face = L"Consolas"; shaded = 1; color = RGB(0x1f, 0x1f, 0x1f); break;
+    case TF_INLINE: face = L"Consolas"; shaded = 1; color = RGB(0x8b, 0x1a, 0x1a); break;
+    case TF_YOU: bold = 1; color = RGB(0xb0, 0x1c, 0x1c); break;  /* the console's user red */
+    case TF_BOT: bold = 1; color = RGB(0x00, 0x00, 0x80); break;  /* the console's navy */
+    case TF_NOTE: italic = 1; color = RGB(0x6e, 0x6e, 0x6e); break;
+    }
+    wcsncpy(cf.szFaceName, face, LF_FACESIZE - 1);
+    cf.dwEffects = (bold ? CFE_BOLD : 0) | (italic ? CFE_ITALIC : 0) |
+		   (shaded ? 0 : CFE_AUTOBACKCOLOR);
+    cf.crTextColor = color;
+    cf.crBackColor = RGB(0xef, 0xef, 0xef);
+    re_select(h, from, to);
+    SendMessage(h, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM) &cf);
+}
+
+/* Left indent, in twips, for the paragraphs in [from, to). */
+static void tr_indent(HWND h, LONG from, LONG to, int twips)
+{
+    PARAFORMAT2 pf;
+    memset(&pf, 0, sizeof pf);
+    pf.cbSize = sizeof pf;
+    pf.dwMask = PFM_STARTINDENT | PFM_OFFSET;
+    pf.dxStartIndent = twips;
+    pf.dxOffset = 0;
+    re_select(h, from, to);
+    SendMessage(h, EM_SETPARAFORMAT, 0, (LPARAM) &pf);
+}
+
+/* RichEdit, set up for reading: wrap at the window edge, no horizontal
+   scroll bar, no length limit, a little margin.  The transcript is
+   switched to rich text (allowed only while empty) so that it can carry
+   formatting.  So is the question box, only so that an emoji in it can
+   have a font that has emoji (see in_before_char); pastes into it stay
+   plain text.
+   RichEdit's own font binding is off in both: it re-fonts whatever
+   follows Chinese or Japanese text (spaces, dashes, emoji) in SimSun and
+   undoes the fonts set here.  Text in Segoe UI still shows every script,
+   through the fonts Windows links to it (the CJK fonts, Segoe UI Symbol);
+   re_fallback_fonts covers the rest. */
+static void re_setup(HWND h)
+{
+    SendMessage(h, EM_SETTEXTMODE, TM_RICHTEXT | TM_MULTILEVELUNDO, 0);
+    LRESULT o = SendMessage(h, EM_GETLANGOPTIONS, 0, 0);
+    SendMessage(h, EM_SETLANGOPTIONS, 0, o & ~(LRESULT) IMF_AUTOFONT);
+    SendMessage(h, EM_SETTARGETDEVICE, 0, 0);
+    SendMessage(h, EM_SHOWSCROLLBAR, SB_HORZ, FALSE);
+    SendMessage(h, EM_EXLIMITTEXT, 0, 0x7FFFFFFE);
+    SendMessage(h, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELONG(6, 6));
+    SendMessage(h, EM_SETBKGNDCOLOR, 0, RGB(0xff, 0xff, 0xff));
+}
+
+/* Whether Consolas has a glyph for c; the answers are kept. */
+static int mono_has(wchar_t c)
+{
+    static unsigned char known[65536];     /* 0 not asked, 1 yes, 2 no */
+    static HDC dc = NULL;
+    static HFONT font = NULL;
+    if (c < 0x200) return 1;               /* Latin: Consolas has it all */
+    if (known[c]) return known[c] == 1;
+    if (!dc) dc = CreateCompatibleDC(NULL);
+    if (dc && !font) {
+	font = CreateFontW(-16, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+			   0, 0, 0, FIXED_PITCH, L"Consolas");
+	if (font) SelectObject(dc, font);
+    }
+    WORD g = 0;
+    if (!dc || !font ||
+	GetGlyphIndicesW(dc, &c, 1, &g, GGI_MARK_NONEXISTING_GLYPHS) == GDI_ERROR)
+	return 1;                          /* cannot tell: leave it alone */
+    known[c] = (g == 0xFFFF) ? 2 : 1;
+    return known[c] == 1;
+}
+
+static void re_face(HWND h, LONG from, LONG to, const wchar_t *face)
+{
+    CHARFORMAT2W cf;
+    memset(&cf, 0, sizeof cf);
+    cf.cbSize = sizeof cf;
+    cf.dwMask = CFM_FACE | CFM_CHARSET;
+    cf.bCharSet = DEFAULT_CHARSET;
+    wcsncpy(cf.szFaceName, face, LF_FACESIZE - 1);
+    re_select(h, from, to);
+    SendMessage(h, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM) &cf);
+}
+
+/* Characters their run's font cannot draw get one that can: emoji
+   (outside the 16-bit range) Segoe UI Emoji, and in Consolas runs
+   anything Consolas lacks -- Chinese in a code comment, a check mark --
+   Segoe UI, with the fonts Windows links to it.  Neighbours needing the
+   same font are formatted together.  Positions are UTF-16 units, as
+   re_replace_sel inserted the text (\r dropped, \n one paragraph mark). */
+static void re_fallback_fonts(HWND h, LONG at, const char *u8, int mono)
+{
+    int any = 0;
+    for (const unsigned char *q = (const unsigned char *) u8; *q; q++)
+	if (*q >= (mono ? 0xC8 : 0xF0)) { any = 1; break; }
+    if (!any) return;
+    wchar_t *w = u8_to_wcs(u8);
+    if (!w) return;
+    enum { F_OWN, F_EMOJI, F_SEGOE };
+    LONG pos = at, run = at;
+    int runf = F_OWN;
+    for (size_t i = 0;; i++) {
+	wchar_t c = w[i];
+	if (c == L'\r') continue;
+	int len = 1, f = F_OWN;
+	if (!c)
+	    f = F_OWN;
+	else if (c >= 0xD800 && c <= 0xDBFF && w[i + 1] >= 0xDC00 && w[i + 1] <= 0xDFFF) {
+	    unsigned cp = 0x10000u + (((unsigned) c - 0xD800u) << 10) +
+		((unsigned) w[i + 1] - 0xDC00u);
+	    f = (cp >= 0x1F000 && cp <= 0x1FAFF) ? F_EMOJI : F_SEGOE;
+	    len = 2;
+	} else if ((c == 0x200D || c == 0xFE0F || c == 0x20E3) && runf == F_EMOJI)
+	    f = F_EMOJI;                   /* joiners and selectors stay with it */
+	else if (mono && !mono_has(c))
+	    f = F_SEGOE;
+	if (f != runf) {
+	    if (runf != F_OWN)
+		re_face(h, run, pos, runf == F_EMOJI ? L"Segoe UI Emoji" : L"Segoe UI");
+	    runf = f;
+	    run = pos;
+	}
+	if (!c) break;
+	pos += len;
+	i += (size_t) (len - 1);
+    }
+    free(w);
+}
+
+/* --- the question box: plain to the user, fonts per character -------- */
+
+/* Its text is Segoe UI, emoji Segoe UI Emoji.  Typed characters get the
+   right font before they go in, so that no formatting step lands on the
+   undo list; pasted and set text is re-fonted after. */
+
+/* The font the next typed character goes in, with nothing selected (with
+   a selection this would re-font the selected text instead). */
+static void in_insertion_face(HWND h, const wchar_t *face)
+{
+    CHARRANGE cr;
+    SendMessage(h, EM_EXGETSEL, 0, (LPARAM) &cr);
+    if (cr.cpMin != cr.cpMax) return;
+    CHARFORMAT2W cf;
+    memset(&cf, 0, sizeof cf);
+    cf.cbSize = sizeof cf;
+    SendMessage(h, EM_GETCHARFORMAT, SCF_SELECTION, (LPARAM) &cf);
+    if ((cf.dwMask & CFM_FACE) && !wcscmp(cf.szFaceName, face)) return;
+    memset(&cf, 0, sizeof cf);
+    cf.cbSize = sizeof cf;
+    cf.dwMask = CFM_FACE | CFM_CHARSET;
+    cf.bCharSet = DEFAULT_CHARSET;
+    wcsncpy(cf.szFaceName, face, LF_FACESIZE - 1);
+    SendMessage(h, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM) &cf);
+}
+
+/* Before a typed character goes in: with nothing selected, set the font
+   it will be inserted in.  The second half of an emoji, and the joiners
+   and selectors that follow one, keep the emoji's. */
+static void in_before_char(HWND h, wchar_t c)
+{
+    if ((c >= 0xDC00 && c <= 0xDFFF) || c == 0x200D || c == 0xFE0F || c == 0x20E3)
+	return;
+    if (c < 0x20 && c != '\t' && c != '\r') return;   /* Backspace, Ctrl+... */
+    in_insertion_face(h,(c >= 0xD800 && c <= 0xDBFF) ? L"Segoe UI Emoji" : L"Segoe UI");
+}
+
+/* Segoe UI for [from, to), then emoji their font. */
+static void in_refont(HWND h, LONG from, LONG to)
+{
+    if (!h || to <= from) return;
+    wchar_t *w = (wchar_t *) calloc((size_t) (to - from) + 1, sizeof(wchar_t));
+    if (!w) return;
+    TEXTRANGEW tr;
+    tr.chrg.cpMin = from;
+    tr.chrg.cpMax = to;
+    tr.lpstrText = w;
+    SendMessage(h, EM_GETTEXTRANGE, 0, (LPARAM) &tr);
+    for (wchar_t *q = w; *q; q++)         /* a paragraph mark is one position */
+	if (*q == L'\r') *q = L'\n';
+    char *u8 = wcs_to_u8(w);
+    free(w);
+    re_face(h, from, to, L"Segoe UI");
+    if (u8) re_fallback_fonts(h, from, u8, 0);
+    free(u8);
+}
+
+/* Segoe UI, as the question then shows in the transcript; Windows links
+   it to fonts for the other scripts and for symbols.  No CFM_CHARSET in
+   this default: with one, RichEdit ignores later font changes to the
+   text, and emoji would keep a font that has none. */
+static void in_setup(HWND h)
+{
+    re_setup(h);
+    CHARFORMAT2W cf;
+    memset(&cf, 0, sizeof cf);
+    cf.cbSize = sizeof cf;
+    cf.dwMask = CFM_FACE | CFM_SIZE | CFM_COLOR;
+    cf.yHeight = tr_points() * 20;
+    cf.crTextColor = RGB(0x1f, 0x1f, 0x1f);
+    wcsncpy(cf.szFaceName, L"Segoe UI", LF_FACESIZE - 1);
+    SendMessage(h, EM_SETCHARFORMAT, SCF_ALL | SCF_DEFAULT, (LPARAM) &cf);
+}
+
+/* Re-font all of it, keeping the selection and without flicker. */
+static void in_refont_all(HWND h)
+{
+    CHARRANGE cr;
+    SendMessage(h, EM_EXGETSEL, 0, (LPARAM) &cr);
+    SendMessage(h, WM_SETREDRAW, FALSE, 0);
+    in_refont(h, 0, re_length(h));
+    SendMessage(h, EM_EXSETSEL, 0, (LPARAM) &cr);
+    in_insertion_face(h, L"Segoe UI");
+    SendMessage(h, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(h, NULL, TRUE);
+}
+
+/* Paste as plain text: a question box has no use for the fonts and
+   colours of a web page or a Word document. */
+static void in_paste(HWND h)
+{
+    if (!IsClipboardFormatAvailable(CF_UNICODETEXT)) return;
+    CHARRANGE a, b;
+    SendMessage(h, EM_EXGETSEL, 0, (LPARAM) &a);
+    SendMessage(h, EM_PASTESPECIAL, CF_UNICODETEXT, 0);
+    SendMessage(h, EM_EXGETSEL, 0, (LPARAM) &b);
+    SendMessage(h, WM_SETREDRAW, FALSE, 0);
+    in_refont(h, a.cpMin, b.cpMax);
+    re_select(h, b.cpMax, b.cpMax);
+    in_insertion_face(h, L"Segoe UI");
+    SendMessage(h, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(h, NULL, TRUE);
+    SendMessage(h, EM_SCROLLCARET, 0, 0);
+}
+
+/* Append text at the end of the transcript in the given format. */
+static void tr_add(HWND h, const char *u8, tfmt f)
+{
+    if (!u8 || !*u8) return;
+    LONG a = re_length(h);
+    re_select(h, a, a);
+    re_replace_sel(h, u8);
+    tr_format(h, a, re_length(h), f);
+    re_fallback_fonts(h, a, u8, f == TF_CODE || f == TF_INLINE);
+}
+
+/* Updates are batched: redraw off, the transcript writable, and the
+   user's selection (they may be copying something) put back after. */
+static CHARRANGE tr_saved;
+static int tr_keep_sel = 0;
+
+static void tr_begin(HWND h)
+{
+    SendMessage(h, EM_EXGETSEL, 0, (LPARAM) &tr_saved);
+    tr_keep_sel = tr_saved.cpMin != tr_saved.cpMax;
+    SendMessage(h, WM_SETREDRAW, FALSE, 0);
+    SendMessage(h, EM_SETREADONLY, FALSE, 0);
+}
+
+static void tr_end(HWND h)
+{
+    SendMessage(h, EM_SETREADONLY, TRUE, 0);
+    if (tr_keep_sel)
+	SendMessage(h, EM_EXSETSEL, 0, (LPARAM) &tr_saved);
+    else {
+	LONG n = re_length(h);
+	re_select(h, n, n);
+    }
+    SendMessage(h, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(h, NULL, TRUE);
+    if (!tr_keep_sel) SendMessage(h, EM_SCROLLCARET, 0, 0);
+}
+
+/* Inline Markdown: **bold**, *italic*, `code`. */
+static void md_inline(HWND h, const char *q)
+{
+    dynbuf run;
+    db_init(&run);
+    int bold = 0, italic = 0;
+#define MD_FLUSH() do { if (run.n) { tr_add(h, run.s, bold ? TF_BOLD : \
+		       italic ? TF_ITALIC : TF_TEXT); run.n = 0; run.s[0] = '\0'; } } while (0)
+    while (*q) {
+	if (*q == '`') {
+	    size_t len = strcspn(q + 1, "`");
+	    if (len && q[1 + len] == '`') {
+		MD_FLUSH();
+		dynbuf code;
+		db_init(&code);
+		db_addn(&code, q + 1, len);
+		tr_add(h, code.s, TF_INLINE);
+		db_free(&code);
+		q += len + 2;
+		continue;
+	    }
+	}
+	if (q[0] == '*' && q[1] == '*' && (bold || strstr(q + 2, "**"))) {
+	    MD_FLUSH();
+	    bold = !bold;
+	    q += 2;
+	    continue;
+	}
+	/* *italic*: only around words, so "2 * 3" stays arithmetic. */
+	if (q[0] == '*' && q[1] != '*') {
+	    const char *e = (q[1] && q[1] != ' ') ? strchr(q + 1, '*') : NULL;
+	    if (italic || (e && e[-1] != ' ')) {
+		MD_FLUSH();
+		italic = !italic;
+		q++;
+		continue;
+	    }
+	}
+	db_addc(&run, *q++);
+    }
+    MD_FLUSH();
+#undef MD_FLUSH
+    db_free(&run);
+}
+
+static struct {
+    dynbuf line;   /* the answer's current, unfinished line (raw) */
+    LONG   start;  /* where its provisional display begins, or -1 */
+    int    code;   /* inside a ``` block */
+} g_md = { { NULL, 0, 0 }, -1, 0 };
+
+/* Render one complete line of Markdown at the end of the transcript. */
+static void md_line(HWND h, const char *line)
+{
+    const char *q = line;
+    int lead = 0;
+    while (*q == ' ' || *q == '\t') { q++; lead++; }
+
+    if (!strncmp(q, "```", 3)) {      /* fences are not shown */
+	g_md.code = !g_md.code;
+	return;
+    }
+    LONG a = re_length(h);
+    if (g_md.code) {
+	tr_add(h, *line ? line : " ", TF_CODE);
+	tr_add(h, "\n", TF_TEXT);
+	tr_indent(h, a, re_length(h) - 1, 240);
+	return;
+    }
+    if (!strcmp(q, "---") || !strcmp(q, "***") || !strcmp(q, "___"))
+	return;                       /* rules add nothing here */
+
+    int hashes = 0;
+    while (q[hashes] == '#') hashes++;
+    int indent = 0;
+    if (hashes >= 1 && hashes <= 6 && q[hashes] == ' ') {
+	tr_add(h, q + hashes + 1, TF_BOLD);
+    } else if ((q[0] == '-' || q[0] == '*' || q[0] == '+') && q[1] == ' ') {
+	tr_add(h, "\xe2\x80\xa2 ", TF_TEXT);      /* U+2022 bullet */
+	md_inline(h, q + 2);
+	indent = 180 + 120 * (lead / 2);
+    } else {
+	md_inline(h, q);
+	if (lead) indent = 120 * (lead / 2);
+    }
+    tr_add(h, "\n", TF_TEXT);
+    /* Up to, not into, the empty paragraph the newline just opened: that
+       one keeps the default until its own line sets it. */
+    tr_indent(h, a, re_length(h) - 1, indent);
+}
+
+/* Start rendering a new answer at the end of the transcript. */
+static void md_begin(HWND h)
+{
+    db_free(&g_md.line);
+    g_md.start = re_length(h);
+    g_md.code = 0;
+}
+
+/* Feed streamed answer text.  final: the answer is complete. */
+static void md_feed(HWND h, const char *chunk, int final)
+{
+    if (!h) return;
+    tr_begin(h);
+    LONG n = re_length(h);
+    if (g_md.start < 0 || g_md.start > n) g_md.start = n;
+    if (n > g_md.start) {               /* drop the provisional line */
+	re_select(h, g_md.start, n);
+	re_replace_sel(h, "");
+    }
+    for (const char *q = chunk ? chunk : ""; *q; q++) {
+	if (*q == '\r') continue;
+	if (*q == '\n') {
+	    md_line(h, g_md.line.s ? g_md.line.s : "");
+	    g_md.line.n = 0;
+	    if (g_md.line.s) g_md.line.s[0] = '\0';
+	} else
+	    db_addc(&g_md.line, *q);
+    }
+    if (final) {
+	if (g_md.line.n) md_line(h, g_md.line.s);
+	db_free(&g_md.line);
+	g_md.code = 0;
+	g_md.start = -1;
+    } else {
+	g_md.start = re_length(h);
+	if (g_md.line.n)                /* shown as typed, formatted at \n */
+	    tr_add(h, g_md.line.s, g_md.code ? TF_CODE : TF_TEXT);
+    }
+    tr_end(h);
+}
+
+/* A whole block in one format, as one batch. */
+static void tr_block(HWND h, const char *u8, tfmt f)
+{
+    if (!h) return;
+    tr_begin(h);
+    tr_add(h, u8, f);
+    tr_end(h);
 }
 
 static void ai_set_status(const char *s)
@@ -1935,7 +2427,8 @@ static void ai_finish_turn(int ok)
 {
     if (g_reply_open) {
 	if (g_reply.n) conv_add("assistant", g_reply.s);
-	edit_append_u8(g_hhist, "\n\n");
+	md_feed(g_hhist, "", 1);
+	tr_block(g_hhist, "\n", TF_TEXT);
 	db_free(&g_reply);
 	g_reply_open = 0;
     }
@@ -1954,7 +2447,7 @@ static void ai_drain_pending(void)
     char *text = g_pending.n ? db_release(&g_pending) : NULL;
     ai_unlock();
     if (!text) return;
-    edit_append_u8(g_hhist, text);
+    md_feed(g_hhist, text, 0);
     db_add(&g_reply, text);
     free(text);
 }
@@ -2107,9 +2600,15 @@ static void ai_do_send(control c)
     }
     conv_add("user", q);
 
-    edit_append_u8(g_hhist, "You:\n");
-    edit_append_u8(g_hhist, q);
-    edit_append_u8(g_hhist, "\n\nR assistant:\n");
+    if (g_hhist) {
+	tr_begin(g_hhist);
+	tr_add(g_hhist, "You\n", TF_YOU);
+	tr_add(g_hhist, q, TF_TEXT);
+	tr_add(g_hhist, "\n\n", TF_TEXT);
+	tr_add(g_hhist, "R assistant\n", TF_BOT);
+	tr_end(g_hhist);
+	md_begin(g_hhist);
+    }
     free(q);
     edit_clear(g_hinput);
 
@@ -2384,6 +2883,7 @@ static void ai_do_clear(control c)
     db_free(&g_reply);
     g_reply_open = 0;
     edit_clear(g_hhist);
+    tr_block(g_hhist, AI_WELCOME, TF_NOTE);
     ai_set_status("New conversation.");
 }
 
@@ -2428,13 +2928,75 @@ static void ai_resize(window w, rect r)
     ai_layout(w, r);
 }
 
-static void ai_keydown(control c, int ch)
+/* GraphApp subclasses every control with an ANSI window procedure, and
+   Windows passes text through it in a buffer of two bytes per character.
+   UTF-8 needs three for a character like \u2264 or \u4e2d and four for an
+   emoji, so typed text and text set from outside came out cut short.
+   This Unicode procedure on top sends characters and text straight to
+   RichEdit's own (Unicode) window procedure; keys, focus and everything
+   else still pass through GraphApp, so its menu shortcuts keep working. */
+static WNDPROC g_re_proc = NULL;                 /* RichEdit's class procedure */
+static WNDPROC g_prev_hist = NULL, g_prev_input = NULL;
+
+static LRESULT CALLBACK ai_box_proc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
-    /* Ctrl+Enter sends.  Plain Enter inserts a newline, so multi-line
-       questions and pasted code still work. */
-    if (ch == 10 ||
-	(ch == 13 && (GetKeyState(VK_CONTROL) & 0x8000)))
-	ai_do_send(c);
+    WNDPROC prev = (h == g_hinput) ? g_prev_input : g_prev_hist;
+    switch (m) {
+    case WM_KEYDOWN:
+    case WM_KEYUP:
+    case WM_SYSKEYDOWN:
+    case WM_SYSKEYUP: {
+	/* RGui's message loop is ANSI (PeekMessageA), and the characters
+	   TranslateMessage has just posted for this key would pass through
+	   the code page when it takes them: a character of more than two
+	   bytes of UTF-8 would arrive as '?'.  Take them off the queue now,
+	   as UTF-16 (an emoji as its two halves), and deliver them here. */
+	LRESULT r = 0;
+	int ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+	if (h == g_hinput && m == WM_KEYDOWN &&
+	    ((w == VK_INSERT && !ctrl && (GetKeyState(VK_SHIFT) & 0x8000)) ||
+	     (w == 'V' && ctrl && !(GetKeyState(VK_MENU) & 0x8000))))
+	    in_paste(h);                   /* not RichEdit's rich paste */
+	else
+	    r = CallWindowProcW(prev, h, m, w, l);
+	MSG c;
+	while (PeekMessageW(&c, h, WM_CHAR, WM_CHAR, PM_REMOVE))
+	    ai_box_proc(h, WM_CHAR, c.wParam, c.lParam);
+	return r;
+    }
+    case WM_PASTE:
+	if (h == g_hinput) {
+	    in_paste(h);
+	    return 0;
+	}
+	break;
+    case WM_CHAR:
+	/* Ctrl+Enter sends.  Plain Enter makes a new line, so multi-line
+	   questions and pasted code still work. */
+	if (h == g_hinput &&
+	    (w == 10 || (w == 13 && (GetKeyState(VK_CONTROL) & 0x8000)))) {
+	    ai_do_send(NULL);
+	    return 0;
+	}
+	if (h == g_hinput) in_before_char(h, (wchar_t) w);
+	if (g_re_proc) return CallWindowProcW(g_re_proc, h, m, w, l);
+	break;
+    case WM_SETTEXT:
+    case EM_REPLACESEL:
+	if (g_re_proc) {
+	    LRESULT r = CallWindowProcW(g_re_proc, h, m, w, l);
+	    if (h == g_hinput) in_refont_all(h);
+	    return r;
+	}
+	break;
+    case WM_UNICHAR:
+    case WM_IME_CHAR:
+    case WM_GETTEXT:
+    case WM_GETTEXTLENGTH:
+	if (g_re_proc) return CallWindowProcW(g_re_proc, h, m, w, l);
+	break;
+    }
+    return CallWindowProcW(prev, h, m, w, l);
 }
 
 static PkgMenuItems g_pmenu = NULL;
@@ -2457,15 +3019,6 @@ static void ai_menu_close(control m) { ai_hide_panel(NULL); }
 
 static void ai_menu_toggle(control m) { aichat_toggle(); }
 
-static const char AI_WELCOME[] =
-    "Local R assistant.\r\n"
-    "Type a question below and press Send (or Ctrl+Enter). The Attach "
-    "menu adds your last error, your script or recent console output.\r\n"
-    "Copy code puts the code from the last answer on the clipboard; "
-    "To editor puts it into your open script, or a new one. Nothing is "
-    "run for you.\r\n"
-    "Nothing leaves this computer.\r\n"
-    "\r\n";
 
 static int ai_create(void)
 {
@@ -2496,8 +3049,8 @@ static int ai_create(void)
     gsetcursor(g_panel, ArrowCursor);
 
     g_status = newlabel("Ready.", rect(0, 0, 10, AI_STATUS_H), AlignLeft);
-    g_hist   = newtextarea("", rect(0, 0, 10, 10));
-    g_input  = newtextbox("",  rect(0, 0, 10, 10));
+    g_hist   = newrichtextarea("", rect(0, 0, 10, 10));
+    g_input  = newrichtextarea("", rect(0, 0, 10, 10));
     g_bsend    = newbutton("Send",       rect(0, 0, AI_BTN_W, AI_BTN_H), ai_do_send);
     g_bstop    = newbutton("Stop",       rect(0, 0, AI_BTN_W, AI_BTN_H), ai_do_stop);
     g_bcopy    = newbutton("Copy code",  rect(0, 0, AI_BTN_W, AI_BTN_H), ai_do_copy);
@@ -2514,18 +3067,28 @@ static int ai_create(void)
     g_hhist  = (HWND) getHandle(g_hist);
     g_hinput = (HWND) getHandle(g_input);
 
-    font f = consolefn ? consolefn : FixedFont;
-    settextfont(g_hist, f);
-    settextfont(g_input, f);
+    if (g_hhist) re_setup(g_hhist);
+    if (g_hinput) in_setup(g_hinput);
+    if (g_hhist) SendMessage(g_hhist, EM_SETREADONLY, TRUE, 0);
 
-    /* A multiline EDIT defaults to a 32 kB limit; 0 removes it. */
-    if (g_hhist) {
-	SendMessage(g_hhist, EM_SETLIMITTEXT, 0, 0);
-	SendMessage(g_hhist, EM_SETREADONLY, TRUE, 0);
+    /* A sunken edge, as RGui's other boxes have: RichEdit draws none of
+       its own, and white on white the question box was invisible. */
+    for (int i = 0; i < 2; i++) {
+	HWND h = i ? g_hinput : g_hhist;
+	if (!h) continue;
+	SetWindowLongPtrW(h, GWL_EXSTYLE,
+			  GetWindowLongPtrW(h, GWL_EXSTYLE) | WS_EX_CLIENTEDGE);
+	SetWindowPos(h, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE |
+		     SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     }
-    if (g_hinput) SendMessage(g_hinput, EM_SETLIMITTEXT, 0, 0);
-
-    setkeydown(g_input, ai_keydown);
+    if (g_hhist) {
+	g_re_proc = (WNDPROC) GetClassLongPtrW(g_hhist, GCLP_WNDPROC);
+	g_prev_hist = (WNDPROC) SetWindowLongPtrW(g_hhist, GWLP_WNDPROC,
+						   (LONG_PTR) ai_box_proc);
+    }
+    if (g_hinput)
+	g_prev_input = (WNDPROC) SetWindowLongPtrW(g_hinput, GWLP_WNDPROC,
+						    (LONG_PTR) ai_box_proc);
 
     /* The same shape of menu bar and toolbar as the console, so RGui's
        top bar does not change when the panel is the active window, and
@@ -2600,7 +3163,7 @@ static int ai_create(void)
     setclose(g_panel, ai_hide_panel);
 
     ai_layout(g_panel, getrect(g_panel));
-    edit_append_u8(g_hhist, AI_WELCOME);
+    tr_block(g_hhist, AI_WELCOME, TF_NOTE);
     ai_set_busy(0);
     return 1;
 }

@@ -32,7 +32,6 @@ void  GA_settext(control c, const char *t)
 void  GA_settextfont(control c, font f) { (void)c; (void)f; }
 void  GA_setclose(control c, actionfn f) { (void)c; (void)f; }
 void  GA_setresize(control c, drawfn f) { (void)c; (void)f; }
-void  GA_setkeydown(control c, keyfn f) { (void)c; (void)f; }
 void  GA_gsetcursor(drawing d, cursor c) { (void)d; (void)c; }
 void *GA_getHandle(window w) { (void)w; return NULL; }
 int   GA_ismdi(void) { return 0; }
