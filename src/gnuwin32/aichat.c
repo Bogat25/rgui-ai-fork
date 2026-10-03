@@ -2328,14 +2328,36 @@ static void tr_add(HWND h, const char *u8, tfmt f)
 }
 
 /* Updates are batched: redraw off, the transcript writable, and the
-   user's selection (they may be copying something) put back after. */
+   user's selection (they may be copying something) and view put back
+   after.  The view follows new text only while it is at the bottom, so
+   someone who scrolled up to read the start of an answer stays there;
+   scrolling back down to the end makes it follow again. */
 static CHARRANGE tr_saved;
 static int tr_keep_sel = 0;
+static POINT tr_scroll;
+static int tr_follow = 0;
+static int tr_force_follow = 0;       /* the next batch scrolls to the end */
+
+/* Whether the transcript shows its last line. */
+static int tr_at_bottom(HWND h)
+{
+    SCROLLINFO si;
+    memset(&si, 0, sizeof si);
+    si.cbSize = sizeof si;
+    si.fMask = SIF_ALL;
+    if (!GetScrollInfo(h, SB_VERT, &si) || si.nMax <= 0 || (int) si.nPage <= 0 ||
+	si.nMax - si.nMin + 1 <= (int) si.nPage)
+	return 1;                     /* no scroll bar: everything is visible */
+    return si.nPos + (int) si.nPage >= si.nMax - 8;
+}
 
 static void tr_begin(HWND h)
 {
     SendMessage(h, EM_EXGETSEL, 0, (LPARAM) &tr_saved);
     tr_keep_sel = tr_saved.cpMin != tr_saved.cpMax;
+    tr_follow = tr_force_follow || tr_at_bottom(h);
+    tr_force_follow = 0;
+    SendMessage(h, EM_GETSCROLLPOS, 0, (LPARAM) &tr_scroll);
     SendMessage(h, WM_SETREDRAW, FALSE, 0);
     SendMessage(h, EM_SETREADONLY, FALSE, 0);
 }
@@ -2349,9 +2371,13 @@ static void tr_end(HWND h)
 	LONG n = re_length(h);
 	re_select(h, n, n);
     }
+    if (tr_follow) {
+	SendMessage(h, EM_SCROLLCARET, 0, 0);
+	SendMessage(h, WM_VSCROLL, SB_BOTTOM, 0);
+    } else
+	SendMessage(h, EM_SETSCROLLPOS, 0, (LPARAM) &tr_scroll);
     SendMessage(h, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(h, NULL, TRUE);
-    if (!tr_keep_sel) SendMessage(h, EM_SCROLLCARET, 0, 0);
 }
 
 /* Inline Markdown: **bold**, *italic*, `code`. */
@@ -2584,7 +2610,62 @@ static void ai_stop_generation(void)
     ai_unlock();
 }
 
+/* While the mouse button is down in the transcript -- someone selecting
+   text -- nothing is written into it: changing it mid-drag would move
+   the selection under the mouse.  The text waits here and goes in when
+   the button is released; a timer checks. */
+#define AI_HOLD_TIMER 0x5A1
+static dynbuf g_hold;                   /* answer text not shown yet */
+static int g_hold_finish = 0;           /* 1 + ok of a turn that ended meanwhile */
+
+static int g_tr_mouse = 0;              /* left button went down in the transcript */
+
+/* Whether the (logical) left mouse button is down right now.
+   GetAsyncKeyState reads the physical buttons, hence the swap check. */
+static int ai_left_button_down(void)
+{
+    int vk = GetSystemMetrics(SM_SWAPBUTTON) ? VK_RBUTTON : VK_LBUTTON;
+    return (GetAsyncKeyState(vk) & 0x8000) != 0;
+}
+static int (*ai_button_down)(void) = ai_left_button_down;   /* tests replace it */
+
+/* Held only while the button is really down, so that no state of ours
+   (or RichEdit's) can keep an answer out of sight once it is released. */
+static int ai_transcript_held(void)
+{
+    if (!g_hhist || !ai_button_down()) { g_tr_mouse = 0; return 0; }
+    return g_tr_mouse || GetCapture() == g_hhist;
+}
+
+static void ai_finish_turn_now(int ok);
+
+static void ai_hold_check(void)
+{
+    if (ai_transcript_held()) return;
+    KillTimer(g_msgwin, AI_HOLD_TIMER);
+    if (g_hold.n) {
+	char *t = db_release(&g_hold);
+	md_feed(g_hhist, t, 0);
+	free(t);
+    }
+    if (g_hold_finish) {
+	int ok = g_hold_finish - 1;
+	g_hold_finish = 0;
+	ai_finish_turn_now(ok);
+    }
+}
+
 static void ai_finish_turn(int ok)
+{
+    if (g_hold.n || ai_transcript_held()) {
+	g_hold_finish = 1 + ok;
+	SetTimer(g_msgwin, AI_HOLD_TIMER, 150, NULL);
+	return;
+    }
+    ai_finish_turn_now(ok);
+}
+
+static void ai_finish_turn_now(int ok)
 {
     if (g_reply_open) {
 	if (g_reply.n) conv_add("assistant", g_reply.s);
@@ -2608,8 +2689,12 @@ static void ai_drain_pending(void)
     char *text = g_pending.n ? db_release(&g_pending) : NULL;
     ai_unlock();
     if (!text) return;
-    md_feed(g_hhist, text, 0);
     db_add(&g_reply, text);
+    if (g_hold.n || ai_transcript_held()) {
+	db_add(&g_hold, text);
+	SetTimer(g_msgwin, AI_HOLD_TIMER, 150, NULL);
+    } else
+	md_feed(g_hhist, text, 0);
     free(text);
 }
 
@@ -2630,6 +2715,9 @@ static LRESULT CALLBACK ai_msgproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_AI_DATA:
 	ai_drain_pending();
 	return 0;
+    case WM_TIMER:
+	if (wp == AI_HOLD_TIMER) { ai_hold_check(); return 0; }
+	break;
     case WM_AI_STATUS: {
 	char *s = (char *) lp;
 	if (s) { ai_set_status(s); free(s); }
@@ -3132,6 +3220,7 @@ static void ai_do_send(control c)
 	return;
     }
     if (g_hhist) {
+	tr_force_follow = 1;          /* a new question is read from the bottom */
 	tr_begin(g_hhist);
 	tr_add(g_hhist, "You\n", TF_YOU);
 	for (int i = 0; i < g_npimg; i++) {
@@ -3536,10 +3625,16 @@ static LRESULT CALLBACK ai_box_proc(HWND h, UINT m, WPARAM w, LPARAM l)
 	    }
 	}
 	break;
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONDBLCLK:
+	if (h == g_hhist) g_tr_mouse = 1;   /* a selection may be starting */
+	break;
     case WM_LBUTTONUP:
 	if (h == g_hhist) {
 	    int i = ai_picture_at((short) LOWORD(l), (short) HIWORD(l));
 	    LRESULT r = CallWindowProcW(prev, h, m, w, l);
+	    g_tr_mouse = 0;
+	    ai_hold_check();                  /* what streamed meanwhile goes in */
 	    if (i >= 0) ai_open_transcript_picture(i);
 	    return r;
 	}

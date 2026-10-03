@@ -476,6 +476,97 @@ static int count_viewers(void)
     return n;
 }
 
+static int test_button_state = 0;
+static int test_button(void) { return test_button_state; }
+
+/* Streaming must not drag the view to the end while the user reads
+   higher up, nor disturb a selection, nor write while they drag one. */
+static void test_transcript_scroll(void)
+{
+    LoadLibraryW(L"msftedit.dll");
+    HWND h = CreateWindowExW(0, L"RICHEDIT50W", L"",
+                             WS_POPUP | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL,
+                             -3000, -3000, 400, 200, NULL, NULL, GetModuleHandle(NULL), NULL);
+    t_ok("scroll: transcript created", h != NULL);
+    if (!h) return;
+    ShowWindow(h, SW_SHOWNOACTIVATE);
+    re_setup(h);
+    SendMessage(h, EM_SETREADONLY, TRUE, 0);
+    dynbuf b;
+    db_init(&b);
+    for (int i = 0; i < 120; i++) db_add(&b, "an earlier line of the conversation\n");
+    tr_block(h, b.s, TF_TEXT);
+    db_free(&b);
+    t_ok("scroll: a long transcript ends at the bottom", tr_at_bottom(h));
+
+    /* scrolled up to read: the view stays */
+    POINT top = { 0, 0 }, now;
+    SendMessage(h, EM_SETSCROLLPOS, 0, (LPARAM) &top);
+    md_begin(h);
+    for (int i = 0; i < 20; i++) md_feed(h, "a streamed **line** of the answer\n", 0);
+    SendMessage(h, EM_GETSCROLLPOS, 0, (LPARAM) &now);
+    t_ok("scroll: scrolled up, the view stays while the answer streams", now.y == 0);
+
+    /* a selection stays as it was */
+    re_select(h, 3, 12);
+    md_feed(h, "more text\n", 0);
+    CHARRANGE cr;
+    SendMessage(h, EM_EXGETSEL, 0, (LPARAM) &cr);
+    t_ok("scroll: a selection is kept", cr.cpMin == 3 && cr.cpMax == 12);
+    SendMessage(h, EM_GETSCROLLPOS, 0, (LPARAM) &now);
+    t_ok("scroll: and the view with it", now.y == 0);
+
+    /* back at the bottom: it follows again */
+    re_select(h, 0, 0);
+    SendMessage(h, WM_VSCROLL, SB_BOTTOM, 0);
+    for (int i = 0; i < 20; i++) md_feed(h, "a line at the end\n", 0);
+    t_ok("scroll: at the bottom, the view follows the answer", tr_at_bottom(h));
+
+    /* a new question always goes to the bottom */
+    SendMessage(h, EM_SETSCROLLPOS, 0, (LPARAM) &top);
+    tr_force_follow = 1;
+    tr_block(h, "You\nanother question\n", TF_TEXT);
+    t_ok("scroll: a new question scrolls to the end", tr_at_bottom(h));
+
+    /* mouse down in the transcript: text waits until it is released */
+    HWND saved = g_hhist;
+    g_hhist = h;
+    g_reply_open = 1;
+    md_begin(h);
+    LONG before = re_length(h);
+    ai_button_down = test_button;
+    test_button_state = 1;
+    SetCapture(h);
+    ai_lock(); db_add(&g_pending, "held text\n"); ai_unlock();
+    ai_drain_pending();
+    t_ok("scroll: while selecting, the answer is not written in", re_length(h) == before);
+    ai_finish_turn(1);
+    t_ok("scroll: nor is the turn finished", g_reply_open == 1);
+    ReleaseCapture();
+    test_button_state = 0;
+    ai_hold_check();
+    char *t = re_get_u8(h);
+    t_ok("scroll: released, the held text goes in", t && strstr(t, "held text"));
+    t_ok("scroll: and the turn finishes", g_reply_open == 0);
+    free(t);
+
+    /* a capture left over with the button up holds nothing back */
+    g_reply_open = 1;
+    md_begin(h);
+    SetCapture(h);
+    ai_lock(); db_add(&g_pending, "not held\n"); ai_unlock();
+    ai_drain_pending();
+    t = re_get_u8(h);
+    t_ok("scroll: with the button up, a stray capture holds nothing", t && strstr(t, "not held"));
+    free(t);
+    ReleaseCapture();
+    ai_finish_turn(1);
+    ai_button_down = ai_left_button_down;
+    conv_clear();
+    g_hhist = saved;
+    DestroyWindow(h);
+}
+
 static void test_transcript_pictures(void)
 {
     LoadLibraryW(L"msftedit.dll");
@@ -1050,6 +1141,7 @@ int main(int argc, char **argv)
     test_relevance();
     test_request_shape();
     test_transcript();
+    test_transcript_scroll();
     test_question_box();
     test_pictures();
     test_transcript_pictures();
