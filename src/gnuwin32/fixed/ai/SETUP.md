@@ -72,9 +72,9 @@ say), use `rgui full` instead; it is incremental too.
 
 | Command | What it proves | Time |
 |---|---|---|
-| `rgui test` | `aichat.c` compiles warning-free with the production flags; JSON, SSE, chunked HTTP, the `<think>` filter, Stop and a missing server behave; captured real `llama-server` output parses correctly; on real RichEdit controls, Markdown renders without its markup, emoji and characters Consolas lacks get fonts that have them, typed or set text in any script arrives whole; pictures are scaled and encoded (JPEG for photos), go into the request before the question, stay for follow-ups up to 4 per request and are left out without the picture reader; the model and the picture reader download in one go, or the reader alone | ~10 s |
+| `rgui test` | `aichat.c` compiles warning-free with the production flags; JSON, SSE, chunked HTTP, the `<think>` filter, Stop and a missing server behave; captured real `llama-server` output parses correctly; on real RichEdit controls, Markdown renders without its markup, emoji and characters Consolas lacks get fonts that have them, typed or set text in any script arrives whole; pictures are scaled and encoded (JPEG for photos), go into the request before the question, stay for follow-ups up to 4 per request and are left out without the picture reader; the model and the picture reader download in one go, or the reader alone; in the transcript (msftedit's RichEdit) a sent picture shows as a thumbnail that a click opens; the strip of attached pictures opens one on a click and removes one with its x | ~10 s |
 | `rgui test -Real` | `aichat.c` starts the real `llama-server` itself (with the picture reader), the model loads, answers with a fenced code block, reads the number in a picture, and the server is stopped again | ~1 min |
-| `rgui test -Gui` | drives the built `Rgui.exe` through window messages: menu entry, panel, all buttons, hide/show/close, Copy code, To editor, R running console code **while** the model answers, the first-run download offer and the download itself, a missing model failing politely, the panel's full menu bar with Ctrl+T, the Attach menu, answers without code (reported, clipboard untouched), To editor into an already open script, a question in Hungarian, Greek, Chinese and emoji reaching the transcript unchanged, answers shown without their Markdown code fences, Attach > Current plot sending the plot itself even with the panel covering it (checked by its colours, as the fake server received it), a follow-up still carrying the picture, a screenshot pasted from the clipboard, Remove pictures, the real model recognising a boxplot, and `llama-server` dying with Rgui | ~3–4 min |
+| `rgui test -Gui` | drives the built `Rgui.exe` through window messages: menu entry, panel, all buttons, hide/show/close, Copy code, To editor, R running console code **while** the model answers, the first-run download offer and the download itself, a missing model failing politely, the panel's full menu bar with Ctrl+T, the Attach menu, answers without code (reported, clipboard untouched), To editor into an already open script, a question in Hungarian, Greek, Chinese and emoji reaching the transcript unchanged, answers shown without their Markdown code fences, Attach > Current plot sending the plot itself even with the panel covering it (checked by its colours, as the fake server received it), a click on an attached thumbnail opening it, a follow-up still carrying the picture, a screenshot pasted from the clipboard, its x and Remove pictures, the real model recognising a boxplot, and `llama-server` dying with Rgui | ~3–4 min |
 | `rgui test -Installer` | installs the last built setup.exe into a folder whose name has a space in it, starts RGui from the Start-menu launcher, upgrades over it (your `Rai.conf`, prompt and notes must survive) and uninstalls it (the program and model go, your `work` folder stays) | ~1 min |
 
 When something fails, the script prints the first error lines of the
@@ -90,7 +90,7 @@ clipboard for the Copy code check and puts your text back afterwards.
 | File | Change |
 |---|---|
 | `src/gnuwin32/aichat.c`, `aichat.h` | new, the whole feature |
-| `src/gnuwin32/aiimage.c`, `aiimage.h` | new, pictures: files, the clipboard, scaling and encoding (GDI+) |
+| `src/gnuwin32/aiimage.c`, `aiimage.h` | new, pictures: files, the clipboard, scaling and encoding (GDI+), the picture window and the strip of attached pictures |
 | `src/gnuwin32/aiplot.c` | new, reads a plot from its windows() device, as `savePlot()` does |
 | `src/gnuwin32/rui.c` | one menu entry in the Misc menu |
 | `src/gnuwin32/system.c` | one call to `aichat_shutdown()` on exit |
@@ -221,9 +221,11 @@ No indexing step, no restart: edit a file, ask the next question.
    pictures: **Current plot** (the plot window as R drew it), **Picture
    file...**, or **Picture from the clipboard**; Ctrl+V of a screenshot
    (Windows+Shift+S) or of picture files copied in Explorer does the
-   same. An "Attached picture" line above the question box shows what
-   goes with the next question; **Remove pictures** drops it. A picture
-   with no question asks what it shows.
+   same. Attached pictures show as thumbnails above the question box:
+   click one to open it full size, or its x to remove it (**Remove
+   pictures** drops them all). Once sent, each shows as a thumbnail in the
+   conversation; click it to open it again. A picture with no question
+   asks what it shows. The picture window resizes freely; Esc closes it.
 7. Use **Copy code**, or **To editor**, which inserts the code at the
    cursor of the script you have open (Ctrl+Z undoes it) or opens a new
    one. Answers without a code block are reported rather than copied.

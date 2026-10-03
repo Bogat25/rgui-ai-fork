@@ -372,15 +372,26 @@ Check 'transcript shows the welcome text' (([Win]::Text($hist)) -like '*Local R 
 # The status line is the panel's GraphApp label, window class "Rgui".
 $statusLabel = [Win]::Descendants($panel) | Where-Object { [Win]::ClassOf($_) -eq 'Rgui' -and [Win]::IsWindowVisible($_) } | Select-Object -First 1
 function Status { if ($statusLabel) { return [string]([Win]::Text($statusLabel)) } else { return '' } }
-# The "Attached picture: ..." line above the question box, when shown.
-function Attach-Text {
+# The strip of attached pictures above the question box: its window text
+# says what is attached ("Attached picture: ..."), empty when hidden.
+function Strip-Window {
     foreach ($h in [Win]::Descendants($panel)) {
-        if ($h -eq $statusLabel -or [Win]::ClassOf($h) -ne 'Rgui' -or -not [Win]::IsWindowVisible($h)) { continue }
-        $t = [string]([Win]::Text($h))
-        if ($t.StartsWith('Attached')) { return $t }
+        if ([Win]::ClassOf($h) -eq 'RGuiAIStrip') { return $h }
     }
-    return ''
+    return [IntPtr]::Zero
 }
+function Attach-Text {
+    $h = Strip-Window
+    if ($h -eq [IntPtr]::Zero -or -not [Win]::IsWindowVisible($h)) { return '' }
+    return [string]([Win]::Text($h))
+}
+# A click in the strip at x, y of its client area (items are 104 px wide,
+# 6 apart, starting at 6; an item's x sits at its top right corner).
+function Click-Strip([int]$X, [int]$Y) {
+    [void][Win]::PostMessageW((Strip-Window), 0x0202, [IntPtr]::Zero, [IntPtr]($Y * 65536 + $X))   # WM_LBUTTONUP
+}
+# The picture windows the panel has opened.
+function Viewers { return @([Win]::TopWindows($ProcessId) | Where-Object { [Win]::ClassOf($_) -eq 'RGuiAIPicture' }) }
 # Draw a plot at the console and wait for its window.
 function Draw-Plot {
     if (-not (Set-Clip "boxplot(len ~ supp * dose, data = ToothGrowth, col = c('orange', 'skyblue'))`n")) { return $false }
@@ -539,9 +550,15 @@ if ($Canned) {
     Check 'a plot is drawn at the console' (Draw-Plot)
     Post-Command $attPlot
     Check 'Current plot attaches it' (Wait-Until { (Attach-Text) -like 'Attached picture: plot, device*' } 10) "attach line: $(Attach-Text)  status: $(Status)"
+    Click-Strip 40 30
+    Check 'a click on the attached picture opens it' (Wait-Until { @(Viewers).Count -ge 1 } 5)
+    $v = (Viewers) | Select-Object -First 1
+    Check 'in a window titled with its name' ($v -and ([string]([Win]::Text($v))) -like 'Picture: plot, device*') "title: $(if ($v) { [Win]::Text($v) })"
+    foreach ($w in (Viewers)) { [void][Win]::PostMessageW($w, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero) }   # WM_CLOSE
+    Check 'and it closes' (Wait-Until { @(Viewers).Count -eq 0 } 5)
     Check 'the picture goes with the question' (Ask 'What kind of plot is this?')
     $ht = [string]([Win]::Text($hist))
-    Check 'the transcript names the picture' ($ht.Contains('Picture: plot, device'))
+    Check 'the transcript shows the picture with its name' ($ht.Contains('Picture: plot, device') -and $ht.Contains('Click it to open it'))
     Check 'the server got one picture' ($ht.Contains('PICTURES last=1 total=1')) "tail: $($ht.Substring([Math]::Max(0, $ht.Length - 200)))"
     Check 'the attached line goes once it is sent' ((Attach-Text) -eq '')
     $recv = Join-Path $ServerDir 'received-1.png'
@@ -579,6 +596,10 @@ if ($Canned) {
     Post-Command $panelPaste
     Check 'Paste with a picture on the clipboard attaches it' `
           (Wait-Until { (Attach-Text) -like '*picture from the clipboard (240 x 120)*' } 10) "attach line: $(Attach-Text)  status: $(Status)"
+    Click-Strip (6 + 104 - 2 - 9) (6 + 2 + 9)
+    Check 'the x on it removes it' (Wait-Until { (Attach-Text) -eq '' -and (Status) -like 'Picture removed*' } 5) "attach line: $(Attach-Text)  status: $(Status)"
+    Post-Command $panelPaste
+    $null = Wait-Until { (Attach-Text) -ne '' } 10
     Post-Command $attRemove
     Check 'Remove pictures drops it' (Wait-Until { (Attach-Text) -eq '' -and (Status) -like 'Pictures removed*' } 5) "status: $(Status)"
 

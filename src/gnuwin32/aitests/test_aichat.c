@@ -171,8 +171,8 @@ static LONG pos_of(HWND h, const char *u8)
 
 static void test_transcript(void)
 {
-    LoadLibraryA("riched20.dll");
-    HWND h = CreateWindowExW(0, L"RichEdit20W", L"", WS_POPUP | ES_MULTILINE,
+    LoadLibraryW(L"msftedit.dll");
+    HWND h = CreateWindowExW(0, AI_TRANSCRIPT_CLASS, L"", WS_POPUP | ES_MULTILINE,
                              0, 0, 400, 300, NULL, NULL, GetModuleHandle(NULL), NULL);
     t_ok("transcript: RichEdit control created", h != NULL);
     if (!h) return;
@@ -261,6 +261,7 @@ static void test_transcript(void)
 /* The question box, with the panel's window procedure on it. */
 static void test_question_box(void)
 {
+    LoadLibraryA("riched20.dll");        /* GraphApp loads it in Rgui */
     HWND h = CreateWindowExW(0, L"RichEdit20W", L"", WS_POPUP | ES_MULTILINE,
                              0, 0, 400, 100, NULL, NULL, GetModuleHandle(NULL), NULL);
     t_ok("question box: RichEdit control created", h != NULL);
@@ -461,6 +462,115 @@ static void test_pictures(void)
     g_pimg[0] = g_pimg[1] = NULL;
     conv_clear();
     CFG = saved;
+}
+
+
+/* A picture sent shows in the transcript as a thumbnail, and a click on
+   it opens it in a window of its own. */
+static int count_viewers(void)
+{
+    int n = 0;
+    HWND w = NULL;
+    while ((w = FindWindowExW(NULL, w, L"RGuiAIPicture", NULL)) != NULL)
+        if (IsWindow(w)) n++;
+    return n;
+}
+
+static void test_transcript_pictures(void)
+{
+    LoadLibraryW(L"msftedit.dll");
+    HWND h = CreateWindowExW(0, AI_TRANSCRIPT_CLASS, L"", WS_OVERLAPPEDWINDOW | ES_MULTILINE,
+                             0, 0, 500, 400, NULL, NULL, GetModuleHandle(NULL), NULL);
+    if (!h) { t_ok("transcript pictures: control created", 0); return; }
+    re_setup(h);
+    HWND saved_hist = g_hhist;
+    g_hhist = h;
+    g_prev_hist = (WNDPROC) SetWindowLongPtrW(h, GWLP_WNDPROC, (LONG_PTR) ai_box_proc);
+    ShowWindow(h, SW_SHOWNOACTIVATE);
+
+    unsigned char *px = make_pixels(600, 400, 0);
+    int w = 0, hh = 0;
+    char *url = aiimg_from_pixels(px, 600, 400, 600 * 4, 1600, &w, &hh);
+    free(px);
+    char **imgs = (char **) malloc(sizeof(char *));
+    imgs[0] = url;
+    conv_clear();
+    g_ntrpics = 0;
+
+    tr_begin(h);
+    tr_add(h, "You\n", TF_YOU);
+    int tw = 0, th = 0;
+    LONG before = re_length(h);
+    LONG cp = tr_add_picture(h, url, &tw, &th);
+    t_ok("transcript pictures: a thumbnail goes in as one character",
+         cp == before && re_length(h) == before + 1);
+    t_ok("transcript pictures: it is fitted to 260 x 170", tw == 255 && th == 170);
+    ai_note_picture(cp, tw, th, g_nconv, 0, "test picture");
+    conv_add_imgs("user", "what is this?", imgs, 1);
+    tr_add(h, "\nwhat is this?\n", TF_TEXT);
+    tr_end(h);
+    UpdateWindow(h);
+
+    POINTL pt = { 0, 0 };
+    SendMessage(h, EM_POSFROMCHAR, (WPARAM) &pt, cp);
+    t_ok("transcript pictures: a point on it finds it",
+         ai_picture_at(pt.x + tw / 2, pt.y + th / 2) == 0);
+    t_ok("transcript pictures: a point on the text does not",
+         ai_picture_at(pt.x + tw / 2, pt.y + th + 60) < 0);
+    int before_v = count_viewers();
+    SendMessageW(h, WM_LBUTTONUP, 0, MAKELPARAM(pt.x + tw / 2, pt.y + th / 2));
+    t_ok("transcript pictures: a click on it opens it", count_viewers() == before_v + 1);
+    HWND v = FindWindowExW(NULL, NULL, L"RGuiAIPicture", NULL);
+    wchar_t title[200] = L"";
+    if (v) GetWindowTextW(v, title, 200);
+    t_ok("transcript pictures: the window is titled with its name",
+         !wcscmp(title, L"Picture: test picture"));
+    if (v) SendMessageW(v, WM_KEYDOWN, VK_ESCAPE, 0);
+    t_ok("transcript pictures: Esc closes it", count_viewers() == before_v);
+
+    conv_clear();
+    g_ntrpics = 0;
+    g_hhist = saved_hist;
+    DestroyWindow(h);
+}
+
+/* The strip of attached pictures: a click opens, the x removes. */
+static void test_strip(void)
+{
+    HWND parent = CreateWindowExW(0, L"STATIC", L"", WS_OVERLAPPEDWINDOW, 0, 0, 600, 200,
+                                  NULL, NULL, GetModuleHandle(NULL), NULL);
+    g_strip = aiimg_strip_new(parent, ai_strip_click);
+    t_ok("strip: created", g_strip != NULL);
+    if (!g_strip) { DestroyWindow(parent); return; }
+    for (int i = 0; i < 3; i++) {
+        unsigned char *px = make_pixels(200 + 100 * i, 150, 0);
+        int w, h;
+        g_pimg[i] = aiimg_from_pixels(px, 200 + 100 * i, 150, (200 + 100 * i) * 4, 1600, &w, &h);
+        snprintf(g_pimg_label[i], sizeof g_pimg_label[0], "pic%d", i + 1);
+        free(px);
+    }
+    g_npimg = 3;
+    ai_images_changed();
+    wchar_t t[300] = L"";
+    GetWindowTextW(g_strip, t, 300);
+    t_ok("strip: says what is attached", !wcscmp(t, L"Attached pictures: pic1, pic2, pic3"));
+    t_ok("strip: shown while there are pictures", IsWindowVisible(g_strip) || !IsWindowVisible(parent));
+
+    /* the x of the second item: items are 104 wide, 6 apart, from 6 */
+    int x = 6 + 1 * (104 + 6) + 104 - 2 - 9, y = 6 + 2 + 9;
+    SendMessageW(g_strip, WM_LBUTTONUP, 0, MAKELPARAM(x, y));
+    t_ok("strip: the x removes that picture",
+         g_npimg == 2 && !strcmp(g_pimg_label[0], "pic1") && !strcmp(g_pimg_label[1], "pic3"));
+    int before = count_viewers();
+    SendMessageW(g_strip, WM_LBUTTONUP, 0, MAKELPARAM(6 + 30, 6 + 30));
+    t_ok("strip: a click on a picture opens it", count_viewers() == before + 1);
+    HWND v = FindWindowExW(NULL, NULL, L"RGuiAIPicture", NULL);
+    if (v) DestroyWindow(v);
+    ai_drop_pictures();
+    GetWindowTextW(g_strip, t, 300);
+    t_ok("strip: empty and hidden once they are gone", t[0] == 0 && !IsWindowVisible(g_strip));
+    DestroyWindow(parent);                /* takes the strip with it */
+    g_strip = NULL;
 }
 
 static void test_find_error(void)
@@ -942,6 +1052,8 @@ int main(int argc, char **argv)
     test_transcript();
     test_question_box();
     test_pictures();
+    test_transcript_pictures();
+    test_strip();
 
     if (argc > 2) {
         /* argv[1] = port, argv[2] = file holding the expected answer */

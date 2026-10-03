@@ -1909,7 +1909,7 @@ static unsigned __stdcall ai_download_worker(void *unused)
 /* ================================================================== */
 
 static window  g_panel   = NULL;
-static control g_hist    = NULL, g_input = NULL, g_status = NULL;
+static control g_input = NULL, g_status = NULL;
 static control g_bsend   = NULL, g_bstop = NULL, g_bcopy = NULL;
 static control g_beditor = NULL, g_bclear = NULL;
 static HWND    g_hhist   = NULL, g_hinput = NULL;
@@ -2791,29 +2791,149 @@ static const char AI_PICTURE_QUESTION[] =
     "What does this picture show? If it is a plot, R output or an error, "
     "explain it.";
 
-static control g_attlbl = NULL;       /* the "Attached: ..." line */
+/* The strip above the question box: a thumbnail of each attached
+   picture, with its name and an x to remove it (aiimage.c).  Its window
+   text says the same in words, for screen readers and the GUI test. */
+static HWND g_strip = NULL;
 static void ai_layout(window w, rect r);
 
 static void ai_images_changed(void)
 {
-    if (!g_attlbl) return;
+    if (!g_strip) return;
+    const char *labels[AI_MAX_IMAGES];
+    for (int i = 0; i < g_npimg; i++) labels[i] = g_pimg_label[i];
+    aiimg_strip_set(g_strip, g_pimg, labels, g_npimg);
+    dynbuf t;
+    db_init(&t);
     if (g_npimg) {
-	dynbuf t;
-	db_init(&t);
 	db_add(&t, g_npimg == 1 ? "Attached picture: " : "Attached pictures: ");
 	for (int i = 0; i < g_npimg; i++) {
 	    if (i) db_add(&t, ", ");
 	    db_add(&t, g_pimg_label[i]);
 	}
-	db_add(&t, ". It goes with your next question (Attach > Remove pictures drops it).");
-	settext(g_attlbl, t.s);
-	db_free(&t);
-	show(g_attlbl);
-    } else {
-	settext(g_attlbl, "");
-	hide(g_attlbl);
     }
+    wchar_t *w = u8_to_wcs(t.s ? t.s : "");
+    SetWindowTextW(g_strip, w ? w : L"");
+    free(w);
+    db_free(&t);
+    ShowWindow(g_strip, g_npimg ? SW_SHOWNA : SW_HIDE);
     if (g_panel) ai_layout(g_panel, getrect(g_panel));
+}
+
+static HWND ai_owner(void)
+{
+    HWND p = g_panel ? (HWND) getHandle(g_panel) : NULL;
+    return p ? GetAncestor(p, GA_ROOT) : NULL;
+}
+
+static void ai_open_picture(const char *url, const char *label)
+{
+    char title[260];
+    snprintf(title, sizeof title, "Picture: %s", label ? label : "");
+    if (!url || !aiimg_show(url, title, ai_owner()))
+	ai_set_status("That picture could not be opened.");
+}
+
+/* A click on the strip: open the picture, or (on its x) remove it. */
+static void ai_strip_click(int i, int remove)
+{
+    if (i < 0 || i >= g_npimg) return;
+    if (!remove) { ai_open_picture(g_pimg[i], g_pimg_label[i]); return; }
+    free(g_pimg[i]);
+    for (int k = i; k + 1 < g_npimg; k++) {
+	g_pimg[k] = g_pimg[k + 1];
+	memcpy(g_pimg_label[k], g_pimg_label[k + 1], sizeof g_pimg_label[0]);
+    }
+    g_pimg[--g_npimg] = NULL;
+    ai_images_changed();
+    ai_set_status("Picture removed.");
+}
+
+/* --- pictures in the transcript ---------------------------------- */
+
+/* Each picture sent shows as a thumbnail in the transcript; a click on it
+   opens it.  The transcript only grows (New chat empties both), so the
+   character position of a thumbnail stays where it was put. */
+typedef struct { LONG cp; int w, h; int msg, k; char label[200]; } trpic;
+static trpic *g_trpics = NULL;
+static int    g_ntrpics = 0;
+
+#define AI_THUMB_W 260
+#define AI_THUMB_H 170
+
+/* Append a thumbnail of url to the transcript as an RTF picture.
+   Returns its character position, or -1. */
+static LONG tr_add_picture(HWND h, const char *url, int *tw, int *th)
+{
+    size_t n = 0;
+    int w = 0, hh = 0;
+    unsigned char *png = aiimg_thumbnail_png(url, AI_THUMB_W, AI_THUMB_H, &n, &w, &hh);
+    if (!png) return -1;
+    dynbuf r;
+    db_init(&r);
+    char head[200];
+    /* Sizes: the picture's own in pixels, the one to show in twips. */
+    snprintf(head, sizeof head, "{\\rtf1{\\pict\\pngblip\\picw%d\\pich%d"
+	     "\\picwgoal%d\\pichgoal%d ", w, hh, w * 15, hh * 15);
+    db_add(&r, head);
+    static const char HEX[] = "0123456789abcdef";
+    if (db_reserve(&r, 2 * n + 4)) {
+	for (size_t i = 0; i < n; i++) {
+	    r.s[r.n++] = HEX[png[i] >> 4];
+	    r.s[r.n++] = HEX[png[i] & 15];
+	}
+	r.s[r.n] = '\0';
+    }
+    db_add(&r, "}}");
+    free(png);
+    LONG a = re_length(h);
+    re_select(h, a, a);
+    SETTEXTEX st;
+    st.flags = ST_SELECTION;
+    st.codepage = CP_ACP;
+    SendMessage(h, EM_SETTEXTEX, (WPARAM) &st, (LPARAM) r.s);
+    db_free(&r);
+    if (re_length(h) <= a) return -1;
+    *tw = w;
+    *th = hh;
+    return a;
+}
+
+static void ai_note_picture(LONG cp, int w, int h, int msg, int k, const char *label)
+{
+    trpic *n = (trpic *) realloc(g_trpics, (size_t) (g_ntrpics + 1) * sizeof(trpic));
+    if (!n) return;
+    g_trpics = n;
+    trpic *t = &g_trpics[g_ntrpics++];
+    t->cp = cp; t->w = w; t->h = h; t->msg = msg; t->k = k;
+    snprintf(t->label, sizeof t->label, "%s", label ? label : "");
+}
+
+/* The thumbnail under a point of the transcript, or -1. */
+static int ai_picture_at(int x, int y)
+{
+    if (!g_hhist || !g_ntrpics) return -1;
+    HDC dc = GetDC(g_hhist);
+    int dpi = dc ? GetDeviceCaps(dc, LOGPIXELSX) : 96;
+    if (dc) ReleaseDC(g_hhist, dc);
+    for (int i = 0; i < g_ntrpics; i++) {
+	POINTL pt = { 0, 0 };
+	SendMessage(g_hhist, EM_POSFROMCHAR, (WPARAM) &pt, g_trpics[i].cp);
+	int w = g_trpics[i].w * dpi / 96, h = g_trpics[i].h * dpi / 96;
+	/* the line the picture is on may be taller than the picture */
+	if (x >= pt.x && x < pt.x + w && y >= pt.y - 4 && y < pt.y + h + 4) return i;
+    }
+    return -1;
+}
+
+static void ai_open_transcript_picture(int i)
+{
+    trpic *t = &g_trpics[i];
+    if (t->msg < 0 || t->msg >= g_nconv || t->k >= g_conv[t->msg].nimg) {
+	ai_set_status("That picture is no longer kept.");
+	return;
+    }
+    ai_open_picture(g_conv[t->msg].imgs[t->k], t->label);
 }
 
 static void ai_drop_pictures(void)
@@ -3015,9 +3135,16 @@ static void ai_do_send(control c)
 	tr_begin(g_hhist);
 	tr_add(g_hhist, "You\n", TF_YOU);
 	for (int i = 0; i < g_npimg; i++) {
+	    /* g_nconv: the index this question gets in the conversation */
+	    int tw = 0, th = 0;
+	    LONG cp = tr_add_picture(g_hhist, g_pimg[i], &tw, &th);
+	    if (cp >= 0) {
+		ai_note_picture(cp, tw, th, g_nconv, i, g_pimg_label[i]);
+		tr_add(g_hhist, "\n", TF_TEXT);
+	    }
 	    tr_add(g_hhist, "Picture: ", TF_NOTE);
 	    tr_add(g_hhist, g_pimg_label[i], TF_NOTE);
-	    tr_add(g_hhist, "\n", TF_NOTE);
+	    tr_add(g_hhist, cp >= 0 ? ". Click it to open it.\n" : "\n", TF_NOTE);
 	}
 	tr_add(g_hhist, q, TF_TEXT);
 	tr_add(g_hhist, "\n\n", TF_TEXT);
@@ -3310,6 +3437,7 @@ static void ai_do_clear(control c)
     if (g_busy) { ai_set_status("Stop the answer first."); return; }
     conv_clear();
     ai_drop_pictures();
+    g_ntrpics = 0;
     db_free(&g_reply);
     g_reply_open = 0;
     edit_clear(g_hhist);
@@ -3339,12 +3467,14 @@ static void ai_layout(window w, rect r)
     int bottom = r.height - AI_PAD - AI_BTN_H;
     int inputy = bottom - 4 - AI_INPUT_H;
     /* The "Attached picture" line, above the question box, when there is one. */
-    int attach = (g_attlbl && g_npimg) ? AI_STATUS_H + 2 : 0;
+    int attach = (g_strip && g_npimg) ? aiimg_strip_height() + 2 : 0;
     int histh  = inputy - 4 - attach - y;
     if (histh < 60) histh = 60;
 
-    if (g_hist)  resize(g_hist,  rect(x, y, ww, histh));
-    if (attach)  resize(g_attlbl, rect(x, inputy - attach, ww, AI_STATUS_H));
+    /* The transcript and the strip are plain child windows: GraphApp's
+       resize() is this same MoveWindow for its own controls. */
+    if (g_hhist) MoveWindow(g_hhist, x, y, ww, histh, TRUE);
+    if (attach)  MoveWindow(g_strip, x, inputy - attach, ww, aiimg_strip_height(), TRUE);
     if (g_input) resize(g_input, rect(x, inputy, ww, AI_INPUT_H));
 
     int bx = x;
@@ -3361,6 +3491,23 @@ static void ai_resize(window w, rect r)
     ai_layout(w, r);
 }
 
+/* The transcript is msftedit's RichEdit (RICHEDIT50W), not GraphApp's
+   RichEdit20W: only the newer one shows pictures given as RTF.  GraphApp
+   has no constructor for it, so it is a plain child window of the panel,
+   placed by ai_layout.  GraphApp's menu shortcuts only work while one of
+   its own controls has the focus, so ai_box_proc handles the panel's two
+   that matter there (Ctrl+T, Ctrl+V); copy and select all are RichEdit's. */
+#define AI_TRANSCRIPT_CLASS L"RICHEDIT50W"
+
+static HWND ai_new_transcript(HWND parent)
+{
+    LoadLibraryW(L"msftedit.dll");
+    return CreateWindowExW(WS_EX_CLIENTEDGE, AI_TRANSCRIPT_CLASS, L"",
+			   WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_TABSTOP |
+			   ES_MULTILINE | ES_AUTOVSCROLL | ES_NOHIDESEL,
+			   0, 0, 10, 10, parent, NULL, GetModuleHandleW(NULL), NULL);
+}
+
 /* GraphApp subclasses every control with an ANSI window procedure, and
    Windows passes text through it in a buffer of two bytes per character.
    UTF-8 needs three for a character like \u2264 or \u4e2d and four for an
@@ -3368,13 +3515,35 @@ static void ai_resize(window w, rect r)
    This Unicode procedure on top sends characters and text straight to
    RichEdit's own (Unicode) window procedure; keys, focus and everything
    else still pass through GraphApp, so its menu shortcuts keep working. */
-static WNDPROC g_re_proc = NULL;                 /* RichEdit's class procedure */
+static WNDPROC g_re_proc = NULL;      /* the question box's RichEdit class procedure */
 static WNDPROC g_prev_hist = NULL, g_prev_input = NULL;
 
 static LRESULT CALLBACK ai_box_proc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     WNDPROC prev = (h == g_hinput) ? g_prev_input : g_prev_hist;
+    /* RichEdit itself: under GraphApp's subclass for the question box; the
+       transcript has no subclass but this one. */
+    WNDPROC re = (h == g_hinput) ? g_re_proc : g_prev_hist;
     switch (m) {
+    case WM_SETCURSOR:
+	if (h == g_hhist && LOWORD(l) == HTCLIENT) {
+	    POINT p;
+	    GetCursorPos(&p);
+	    ScreenToClient(h, &p);
+	    if (ai_picture_at(p.x, p.y) >= 0) {
+		SetCursor(LoadCursor(NULL, IDC_HAND));
+		return TRUE;
+	    }
+	}
+	break;
+    case WM_LBUTTONUP:
+	if (h == g_hhist) {
+	    int i = ai_picture_at((short) LOWORD(l), (short) HIWORD(l));
+	    LRESULT r = CallWindowProcW(prev, h, m, w, l);
+	    if (i >= 0) ai_open_transcript_picture(i);
+	    return r;
+	}
+	break;
     case WM_KEYDOWN:
     case WM_KEYUP:
     case WM_SYSKEYDOWN:
@@ -3386,7 +3555,12 @@ static LRESULT CALLBACK ai_box_proc(HWND h, UINT m, WPARAM w, LPARAM l)
 	   as UTF-16 (an emoji as its two halves), and deliver them here. */
 	LRESULT r = 0;
 	int ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
-	if (h == g_hinput && m == WM_KEYDOWN &&
+	int alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
+	if (h == g_hhist && m == WM_KEYDOWN && ctrl && !alt &&
+	    (w == (WPARAM) aichat_hotkey() || w == 'V')) {
+	    if (w == 'V') ai_do_edit_paste(NULL);     /* into the question box */
+	    else aichat_toggle();
+	} else if (h == g_hinput && m == WM_KEYDOWN &&
 	    ((w == VK_INSERT && !ctrl && (GetKeyState(VK_SHIFT) & 0x8000)) ||
 	     (w == 'V' && ctrl && !(GetKeyState(VK_MENU) & 0x8000))))
 	    in_paste(h);                   /* not RichEdit's rich paste */
@@ -3412,12 +3586,12 @@ static LRESULT CALLBACK ai_box_proc(HWND h, UINT m, WPARAM w, LPARAM l)
 	    return 0;
 	}
 	if (h == g_hinput) in_before_char(h, (wchar_t) w);
-	if (g_re_proc) return CallWindowProcW(g_re_proc, h, m, w, l);
+	if (re) return CallWindowProcW(re, h, m, w, l);
 	break;
     case WM_SETTEXT:
     case EM_REPLACESEL:
-	if (g_re_proc) {
-	    LRESULT r = CallWindowProcW(g_re_proc, h, m, w, l);
+	if (re) {
+	    LRESULT r = CallWindowProcW(re, h, m, w, l);
 	    if (h == g_hinput) in_refont_all(h);
 	    return r;
 	}
@@ -3426,7 +3600,7 @@ static LRESULT CALLBACK ai_box_proc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_IME_CHAR:
     case WM_GETTEXT:
     case WM_GETTEXTLENGTH:
-	if (g_re_proc) return CallWindowProcW(g_re_proc, h, m, w, l);
+	if (re) return CallWindowProcW(re, h, m, w, l);
 	break;
     }
     return CallWindowProcW(prev, h, m, w, l);
@@ -3482,8 +3656,9 @@ static int ai_create(void)
     gsetcursor(g_panel, ArrowCursor);
 
     g_status = newlabel("Ready.", rect(0, 0, 10, AI_STATUS_H), AlignLeft);
-    g_attlbl = newlabel("", rect(0, 0, 10, AI_STATUS_H), AlignLeft);
-    g_hist   = newrichtextarea("", rect(0, 0, 10, 10));
+    HWND hpanel = (HWND) getHandle(g_panel);
+    g_hhist  = ai_new_transcript(hpanel);
+    g_strip  = aiimg_strip_new(hpanel, ai_strip_click);
     g_input  = newrichtextarea("", rect(0, 0, 10, 10));
     g_bsend    = newbutton("Send",       rect(0, 0, AI_BTN_W, AI_BTN_H), ai_do_send);
     g_bstop    = newbutton("Stop",       rect(0, 0, AI_BTN_W, AI_BTN_H), ai_do_stop);
@@ -3491,14 +3666,16 @@ static int ai_create(void)
     g_beditor  = newbutton("To editor",  rect(0, 0, AI_BTN_W, AI_BTN_H), ai_do_editor);
     g_bclear   = newbutton("New chat",   rect(0, 0, AI_BTN_W, AI_BTN_H), ai_do_clear);
 
-    if (!g_status || !g_attlbl || !g_hist || !g_input || !g_bsend || !g_bstop ||
+    if (!g_status || !g_hhist || !g_strip || !g_input || !g_bsend || !g_bstop ||
 	!g_bcopy || !g_beditor || !g_bclear) {
+	if (g_hhist) DestroyWindow(g_hhist);
+	if (g_strip) DestroyWindow(g_strip);
+	g_hhist = g_strip = NULL;
 	del(g_panel);
 	g_panel = NULL;
 	return 0;
     }
 
-    g_hhist  = (HWND) getHandle(g_hist);
     g_hinput = (HWND) getHandle(g_input);
 
     if (g_hhist) re_setup(g_hhist);
@@ -3507,22 +3684,20 @@ static int ai_create(void)
 
     /* A sunken edge, as RGui's other boxes have: RichEdit draws none of
        its own, and white on white the question box was invisible. */
-    for (int i = 0; i < 2; i++) {
-	HWND h = i ? g_hinput : g_hhist;
-	if (!h) continue;
+    {
+	HWND h = g_hinput;              /* the transcript has its edge already */
 	SetWindowLongPtrW(h, GWL_EXSTYLE,
 			  GetWindowLongPtrW(h, GWL_EXSTYLE) | WS_EX_CLIENTEDGE);
 	SetWindowPos(h, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE |
 		     SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     }
-    if (g_hhist) {
-	g_re_proc = (WNDPROC) GetClassLongPtrW(g_hhist, GCLP_WNDPROC);
-	g_prev_hist = (WNDPROC) SetWindowLongPtrW(g_hhist, GWLP_WNDPROC,
-						   (LONG_PTR) ai_box_proc);
-    }
-    if (g_hinput)
+    g_prev_hist = (WNDPROC) SetWindowLongPtrW(g_hhist, GWLP_WNDPROC,
+					       (LONG_PTR) ai_box_proc);
+    if (g_hinput) {
+	g_re_proc = (WNDPROC) GetClassLongPtrW(g_hinput, GCLP_WNDPROC);
 	g_prev_input = (WNDPROC) SetWindowLongPtrW(g_hinput, GWLP_WNDPROC,
 						    (LONG_PTR) ai_box_proc);
+    }
 
     /* The same shape of menu bar and toolbar as the console, so RGui's
        top bar does not change when the panel is the active window, and
@@ -3601,7 +3776,6 @@ static int ai_create(void)
        restores the conversation. */
     setclose(g_panel, ai_hide_panel);
 
-    hide(g_attlbl);
     ai_layout(g_panel, getrect(g_panel));
     tr_block(g_hhist, AI_WELCOME, TF_NOTE);
     ai_set_busy(0);

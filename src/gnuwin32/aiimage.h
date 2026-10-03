@@ -46,6 +46,23 @@ wchar_t *aiimg_clipboard_files(void);
    Explorer, and no text (text is pasted as text). */
 int aiimg_clipboard_has_picture(void);
 
+/* A PNG of the picture in a data URL, fitted into maxw x maxh, for the
+   transcript; malloc'd bytes, *n of them, size in *w x *h. */
+unsigned char *aiimg_thumbnail_png(const char *url, int maxw, int maxh,
+				   size_t *n, int *w, int *h);
+
+/* Open the picture in a window of its own (owned by owner): resizable,
+   fitted to the window, Esc closes it.  Returns 0 if it cannot. */
+int aiimg_show(const char *url, const char *title_u8, HWND owner);
+
+/* The strip of attached pictures above the question box: thumbnails
+   with their names, an x on each.  fn(index, remove) is called on a
+   click: remove 1 for the x, 0 for the picture itself. */
+typedef void (*aiimg_strip_fn)(int index, int remove);
+HWND aiimg_strip_new(HWND parent, aiimg_strip_fn fn);
+void aiimg_strip_set(HWND strip, char *const *urls, const char *const *labels, int n);
+int  aiimg_strip_height(void);
+
 void aiimg_shutdown(void);
 
 #endif

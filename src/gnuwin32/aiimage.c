@@ -151,20 +151,20 @@ static void upright(GpImage *img)
     free(pi);
 }
 
-/* Scale src (longer side at most maxside) onto white, and encode it. */
-static char *encode(GpImage *src, int maxside, int *pw, int *ph)
+/* A copy of src scaled so that it fits in maxw x maxh (never enlarged),
+   on white, in memory GDI+ owns.  Size in *pw, *ph. */
+static GpBitmap *scaled(GpImage *src, int maxw, int maxh, UINT *pw, UINT *ph)
 {
     UINT w = 0, h = 0;
     GdipGetImageWidth(src, &w);
     GdipGetImageHeight(src, &h);
     if (!w || !h) return NULL;
-    UINT nw = w, nh = h;
-    if (maxside > 0 && (w > (UINT) maxside || h > (UINT) maxside)) {
-	if (w >= h) { nw = (UINT) maxside; nh = (UINT) ((double) h * maxside / w + 0.5); }
-	else        { nh = (UINT) maxside; nw = (UINT) ((double) w * maxside / h + 0.5); }
-	if (!nw) nw = 1;
-	if (!nh) nh = 1;
-    }
+    double f = 1.0;
+    if (maxw > 0 && w > (UINT) maxw) f = (double) maxw / w;
+    if (maxh > 0 && h * f > maxh) f = (double) maxh / h;
+    UINT nw = (UINT) (w * f + 0.5), nh = (UINT) (h * f + 0.5);
+    if (!nw) nw = 1;
+    if (!nh) nh = 1;
     GpBitmap *dst = NULL;
     if (GdipCreateBitmapFromScan0((INT) nw, (INT) nh, 0, PixelFormat24bppRGB, NULL, &dst) != Ok)
 	return NULL;
@@ -177,6 +177,17 @@ static char *encode(GpImage *src, int maxside, int *pw, int *ph)
 	GdipDrawImageRectI(g, src, 0, 0, (INT) nw, (INT) nh);
 	GdipDeleteGraphics(g);
     }
+    *pw = nw;
+    *ph = nh;
+    return dst;
+}
+
+/* Scale src (longer side at most maxside) and encode it. */
+static char *encode(GpImage *src, int maxside, int *pw, int *ph)
+{
+    UINT nw = 0, nh = 0;
+    GpBitmap *dst = scaled(src, maxside, maxside, &nw, &nh);
+    if (!dst) return NULL;
     char *url = NULL;
     size_t n = 0;
     unsigned char *bytes = save((GpImage *) dst, &PNG_ENC, NULL, &n);
@@ -309,4 +320,429 @@ char *aiimg_from_clipboard(int maxside, int *w, int *h)
     }
     CloseClipboard();
     return url;
+}
+
+/* ------------------------------------------------------------------ */
+/* showing pictures: decoding, the viewer, the strip of attachments    */
+/* ------------------------------------------------------------------ */
+
+static int b64val(int c)
+{
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+/* The bytes inside a data URL, malloc'd. */
+static unsigned char *url_bytes(const char *url, size_t *n)
+{
+    *n = 0;
+    const char *b = url ? strchr(url, ',') : NULL;
+    if (!b) return NULL;
+    b++;
+    unsigned char *out = (unsigned char *) malloc(strlen(b) * 3 / 4 + 3);
+    if (!out) return NULL;
+    unsigned acc = 0;
+    int bits = 0;
+    for (; *b && *b != '='; b++) {
+	int v = b64val((unsigned char) *b);
+	if (v < 0) continue;
+	acc = (acc << 6) | (unsigned) v;
+	bits += 6;
+	if (bits >= 8) {
+	    bits -= 8;
+	    out[(*n)++] = (unsigned char) ((acc >> bits) & 0xFF);
+	}
+    }
+    return out;
+}
+
+/* A data URL decoded into a bitmap GDI+ owns outright (one made from a
+   stream keeps reading the stream, which would have to live as long). */
+static GpBitmap *bitmap_from_url(const char *url)
+{
+    if (!gdip_up()) return NULL;
+    size_t n = 0;
+    unsigned char *bytes = url_bytes(url, &n);
+    if (!bytes || !n) { free(bytes); return NULL; }
+    GpBitmap *res = NULL;
+    HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, n);
+    void *p = hg ? GlobalLock(hg) : NULL;
+    if (p) {
+	memcpy(p, bytes, n);
+	GlobalUnlock(hg);
+	IStream *st = NULL;
+	if (CreateStreamOnHGlobal(hg, TRUE, &st) == S_OK) {
+	    GpBitmap *b = NULL;
+	    if (GdipCreateBitmapFromStream(st, &b) == Ok && b) {
+		UINT w, h;
+		res = scaled((GpImage *) b, 0, 0, &w, &h);    /* a full copy */
+		GdipDisposeImage((GpImage *) b);
+	    }
+	    IStream_Release(st);                 /* frees hg too */
+	} else
+	    GlobalFree(hg);
+    } else if (hg)
+	GlobalFree(hg);
+    free(bytes);
+    return res;
+}
+
+unsigned char *aiimg_thumbnail_png(const char *url, int maxw, int maxh,
+				   size_t *n, int *w, int *h)
+{
+    *n = 0;
+    GpBitmap *b = bitmap_from_url(url);
+    if (!b) return NULL;
+    UINT tw = 0, th = 0;
+    GpBitmap *t = scaled((GpImage *) b, maxw, maxh, &tw, &th);
+    GdipDisposeImage((GpImage *) b);
+    if (!t) return NULL;
+    unsigned char *png = save((GpImage *) t, &PNG_ENC, NULL, n);
+    GdipDisposeImage((GpImage *) t);
+    if (png) { *w = (int) tw; *h = (int) th; }
+    return png;
+}
+
+/* Draw b into r of a memory DC, fitted and centred, never enlarged
+   beyond twice its size. */
+static void draw_fitted(HDC dc, GpBitmap *b, RECT r)
+{
+    UINT w = 0, h = 0;
+    GdipGetImageWidth((GpImage *) b, &w);
+    GdipGetImageHeight((GpImage *) b, &h);
+    int rw = r.right - r.left, rh = r.bottom - r.top;
+    if (!w || !h || rw <= 0 || rh <= 0) return;
+    double f = (double) rw / w;
+    if ((double) rh / h < f) f = (double) rh / h;
+    if (f > 2.0) f = 2.0;
+    int dw = (int) (w * f + 0.5), dh = (int) (h * f + 0.5);
+    GpGraphics *g = NULL;
+    if (GdipCreateFromHDC(dc, &g) != Ok) return;
+    GdipSetInterpolationMode(g, f < 1.0 ? InterpolationModeHighQualityBicubic
+			     : InterpolationModeNearestNeighbor);
+    GdipSetPixelOffsetMode(g, PixelOffsetModeHighQuality);
+    GdipDrawImageRectI(g, (GpImage *) b, r.left + (rw - dw) / 2, r.top + (rh - dh) / 2, dw, dh);
+    GdipDeleteGraphics(g);
+}
+
+/* --- the viewer: one window per picture opened ---------------------- */
+
+static LRESULT CALLBACK viewer_proc(HWND hw, UINT m, WPARAM wp, LPARAM lp)
+{
+    GpBitmap *b = (GpBitmap *) GetWindowLongPtrW(hw, GWLP_USERDATA);
+    switch (m) {
+    case WM_ERASEBKGND:
+	return 1;
+    case WM_SIZE:
+	InvalidateRect(hw, NULL, FALSE);
+	return 0;
+    case WM_PAINT: {
+	PAINTSTRUCT ps;
+	HDC dc = BeginPaint(hw, &ps);
+	RECT rc;
+	GetClientRect(hw, &rc);
+	/* Through a memory bitmap, so that resizing does not flicker. */
+	HDC mdc = CreateCompatibleDC(dc);
+	HBITMAP mb = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
+	HGDIOBJ old = SelectObject(mdc, mb);
+	HBRUSH bg = CreateSolidBrush(RGB(0x30, 0x30, 0x30));
+	FillRect(mdc, &rc, bg);
+	DeleteObject(bg);
+	if (b) {
+	    RECT in = { 8, 8, rc.right - 8, rc.bottom - 8 };
+	    draw_fitted(mdc, b, in);
+	}
+	BitBlt(dc, 0, 0, rc.right, rc.bottom, mdc, 0, 0, SRCCOPY);
+	SelectObject(mdc, old);
+	DeleteObject(mb);
+	DeleteDC(mdc);
+	EndPaint(hw, &ps);
+	return 0;
+    }
+    case WM_KEYDOWN:
+	if (wp == VK_ESCAPE) { DestroyWindow(hw); return 0; }
+	break;
+    case WM_NCDESTROY:
+	if (b) GdipDisposeImage((GpImage *) b);
+	SetWindowLongPtrW(hw, GWLP_USERDATA, 0);
+	break;
+    }
+    return DefWindowProcW(hw, m, wp, lp);
+}
+
+int aiimg_show(const char *url, const char *title_u8, HWND owner)
+{
+    static int registered = 0;
+    HINSTANCE inst = GetModuleHandleW(NULL);
+    if (!registered) {
+	WNDCLASSW wc;
+	memset(&wc, 0, sizeof wc);
+	wc.lpfnWndProc = viewer_proc;
+	wc.hInstance = inst;
+	wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+	wc.hIcon = LoadIcon(inst, MAKEINTRESOURCE(1));   /* RGui's own, if any */
+	wc.lpszClassName = L"RGuiAIPicture";
+	registered = RegisterClassW(&wc) != 0;
+	if (!registered) return 0;
+    }
+    GpBitmap *b = bitmap_from_url(url);
+    if (!b) return 0;
+    UINT w = 0, h = 0;
+    GdipGetImageWidth((GpImage *) b, &w);
+    GdipGetImageHeight((GpImage *) b, &h);
+
+    /* Big enough for the picture, at most 85% of the screen RGui is on. */
+    MONITORINFO mi;
+    mi.cbSize = sizeof mi;
+    RECT work = { 0, 0, 1024, 768 };
+    if (GetMonitorInfoW(MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST), &mi))
+	work = mi.rcWork;
+    int maxw = (work.right - work.left) * 85 / 100, maxh = (work.bottom - work.top) * 85 / 100;
+    RECT r = { 0, 0, (LONG) w + 16, (LONG) h + 16 };
+    DWORD style = WS_OVERLAPPEDWINDOW;
+    AdjustWindowRect(&r, style, FALSE);
+    int ww = r.right - r.left, wh = r.bottom - r.top;
+    if (ww > maxw || wh > maxh) {
+	double f = (double) maxw / ww;
+	if ((double) maxh / wh < f) f = (double) maxh / wh;
+	ww = (int) (ww * f);
+	wh = (int) (wh * f);
+    }
+    if (ww < 320) ww = 320;
+    if (wh < 240) wh = 240;
+    int x = work.left + ((work.right - work.left) - ww) / 2;
+    int y = work.top + ((work.bottom - work.top) - wh) / 2;
+
+    int tn = MultiByteToWideChar(CP_UTF8, 0, title_u8 ? title_u8 : "Picture", -1, NULL, 0);
+    wchar_t *title = (wchar_t *) calloc((size_t) (tn > 0 ? tn : 1) + 16, sizeof(wchar_t));
+    if (title) MultiByteToWideChar(CP_UTF8, 0, title_u8 ? title_u8 : "Picture", -1, title, tn);
+    HWND hw = CreateWindowExW(0, L"RGuiAIPicture", title ? title : L"Picture", style,
+			      x, y, ww, wh, owner, NULL, inst, NULL);
+    free(title);
+    if (!hw) { GdipDisposeImage((GpImage *) b); return 0; }
+    SetWindowLongPtrW(hw, GWLP_USERDATA, (LONG_PTR) b);
+    ShowWindow(hw, SW_SHOWNORMAL);
+    UpdateWindow(hw);
+    return 1;
+}
+
+/* --- the strip of attached pictures --------------------------------- */
+
+#define STRIP_TH    56          /* thumbnail height */
+#define STRIP_ITEM  104         /* width of one item */
+#define STRIP_PAD   6
+#define STRIP_X     9           /* radius of the remove button */
+
+typedef struct {
+    int n;
+    GpBitmap *thumb[16];
+    wchar_t *label[16];
+    RECT item[16], close[16];
+    int hot_close;              /* index under the mouse on an x, or -1 */
+    aiimg_strip_fn fn;
+    HFONT font;
+} strip;
+
+int aiimg_strip_height(void) { return STRIP_PAD + STRIP_TH + 18 + STRIP_PAD; }
+
+static void strip_clear(strip *s)
+{
+    for (int i = 0; i < s->n; i++) {
+	if (s->thumb[i]) GdipDisposeImage((GpImage *) s->thumb[i]);
+	free(s->label[i]);
+    }
+    s->n = 0;
+}
+
+static void strip_layout(strip *s)
+{
+    for (int i = 0; i < s->n; i++) {
+	RECT r = { STRIP_PAD + i * (STRIP_ITEM + STRIP_PAD), STRIP_PAD, 0, 0 };
+	r.right = r.left + STRIP_ITEM;
+	r.bottom = r.top + STRIP_TH + 18;
+	s->item[i] = r;
+	RECT c = { r.right - 2 * STRIP_X - 2, r.top + 2, r.right - 2, r.top + 2 + 2 * STRIP_X };
+	s->close[i] = c;
+    }
+}
+
+static int strip_hit(strip *s, int x, int y, int *onclose)
+{
+    POINT p = { x, y };
+    for (int i = 0; i < s->n; i++) {
+	if (PtInRect(&s->close[i], p)) { *onclose = 1; return i; }
+	if (PtInRect(&s->item[i], p))  { *onclose = 0; return i; }
+    }
+    return -1;
+}
+
+static void strip_paint(HWND hw, strip *s, HDC dc)
+{
+    RECT rc;
+    GetClientRect(hw, &rc);
+    HDC mdc = CreateCompatibleDC(dc);
+    HBITMAP mb = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
+    HGDIOBJ old = SelectObject(mdc, mb);
+    FillRect(mdc, &rc, GetSysColorBrush(COLOR_BTNFACE));
+    HGDIOBJ oldf = SelectObject(mdc, s->font ? (HGDIOBJ) s->font : GetStockObject(DEFAULT_GUI_FONT));
+    SetBkMode(mdc, TRANSPARENT);
+    for (int i = 0; i < s->n; i++) {
+	RECT it = s->item[i];
+	RECT box = { it.left, it.top, it.right, it.top + STRIP_TH };
+	FillRect(mdc, &box, (HBRUSH) GetStockObject(WHITE_BRUSH));
+	FrameRect(mdc, &box, GetSysColorBrush(COLOR_BTNSHADOW));
+	if (s->thumb[i]) {
+	    RECT in = { box.left + 2, box.top + 2, box.right - 2, box.bottom - 2 };
+	    draw_fitted(mdc, s->thumb[i], in);
+	}
+	/* the remove button: a dark disc with a white x, red under the mouse */
+	RECT c = s->close[i];
+	HBRUSH disc = CreateSolidBrush(s->hot_close == i ? RGB(0xc4, 0x2b, 0x1c) : RGB(0x50, 0x50, 0x50));
+	HGDIOBJ ob = SelectObject(mdc, disc);
+	HGDIOBJ op = SelectObject(mdc, GetStockObject(NULL_PEN));
+	Ellipse(mdc, c.left, c.top, c.right + 1, c.bottom + 1);
+	SelectObject(mdc, op);
+	SelectObject(mdc, ob);
+	DeleteObject(disc);
+	HPEN pen = CreatePen(PS_SOLID, 2, RGB(0xff, 0xff, 0xff));
+	op = SelectObject(mdc, pen);
+	int cx = (c.left + c.right) / 2, cy = (c.top + c.bottom) / 2, d = STRIP_X / 2;
+	MoveToEx(mdc, cx - d, cy - d, NULL); LineTo(mdc, cx + d + 1, cy + d + 1);
+	MoveToEx(mdc, cx + d, cy - d, NULL); LineTo(mdc, cx - d - 1, cy + d + 1);
+	SelectObject(mdc, op);
+	DeleteObject(pen);
+	RECT lr = { it.left, box.bottom + 2, it.right, it.bottom };
+	SetTextColor(mdc, GetSysColor(COLOR_BTNTEXT));
+	if (s->label[i])
+	    DrawTextW(mdc, s->label[i], -1, &lr, DT_CENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+    }
+    if (s->n) {
+	RECT hint = { s->item[s->n - 1].right + 2 * STRIP_PAD, STRIP_PAD, rc.right - STRIP_PAD, STRIP_PAD + STRIP_TH };
+	SetTextColor(mdc, GetSysColor(COLOR_GRAYTEXT));
+	DrawTextW(mdc, L"Goes with your next question.\nClick a picture to open it; x removes it.",
+		  -1, &hint, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX | DT_END_ELLIPSIS);
+    }
+    SelectObject(mdc, oldf);
+    BitBlt(dc, 0, 0, rc.right, rc.bottom, mdc, 0, 0, SRCCOPY);
+    SelectObject(mdc, old);
+    DeleteObject(mb);
+    DeleteDC(mdc);
+}
+
+static LRESULT CALLBACK strip_proc(HWND hw, UINT m, WPARAM wp, LPARAM lp)
+{
+    strip *s = (strip *) GetWindowLongPtrW(hw, GWLP_USERDATA);
+    switch (m) {
+    case WM_ERASEBKGND:
+	return 1;
+    case WM_PAINT: {
+	PAINTSTRUCT ps;
+	HDC dc = BeginPaint(hw, &ps);
+	if (s) strip_paint(hw, s, dc);
+	EndPaint(hw, &ps);
+	return 0;
+    }
+    case WM_SIZE:
+	InvalidateRect(hw, NULL, FALSE);
+	return 0;
+    case WM_SETCURSOR:
+	if (s && LOWORD(lp) == HTCLIENT) {
+	    POINT p;
+	    GetCursorPos(&p);
+	    ScreenToClient(hw, &p);
+	    int onclose = 0;
+	    SetCursor(LoadCursor(NULL, strip_hit(s, p.x, p.y, &onclose) >= 0 ? IDC_HAND : IDC_ARROW));
+	    return TRUE;
+	}
+	break;
+    case WM_MOUSEMOVE:
+	if (s) {
+	    int onclose = 0;
+	    int i = strip_hit(s, (short) LOWORD(lp), (short) HIWORD(lp), &onclose);
+	    int hot = (i >= 0 && onclose) ? i : -1;
+	    if (hot != s->hot_close) {
+		s->hot_close = hot;
+		InvalidateRect(hw, NULL, FALSE);
+	    }
+	    TRACKMOUSEEVENT t = { sizeof t, TME_LEAVE, hw, 0 };
+	    TrackMouseEvent(&t);
+	}
+	return 0;
+    case WM_MOUSELEAVE:
+	if (s && s->hot_close >= 0) {
+	    s->hot_close = -1;
+	    InvalidateRect(hw, NULL, FALSE);
+	}
+	return 0;
+    case WM_LBUTTONUP:
+	if (s && s->fn) {
+	    int onclose = 0;
+	    int i = strip_hit(s, (short) LOWORD(lp), (short) HIWORD(lp), &onclose);
+	    /* The callback may change the strip: nothing of s after it. */
+	    if (i >= 0) s->fn(i, onclose);
+	}
+	return 0;
+    case WM_NCDESTROY:
+	if (s) {
+	    strip_clear(s);
+	    if (s->font) DeleteObject(s->font);
+	    free(s);
+	    SetWindowLongPtrW(hw, GWLP_USERDATA, 0);
+	}
+	break;
+    }
+    return DefWindowProcW(hw, m, wp, lp);
+}
+
+HWND aiimg_strip_new(HWND parent, aiimg_strip_fn fn)
+{
+    static int registered = 0;
+    HINSTANCE inst = GetModuleHandleW(NULL);
+    if (!registered) {
+	WNDCLASSW wc;
+	memset(&wc, 0, sizeof wc);
+	wc.lpfnWndProc = strip_proc;
+	wc.hInstance = inst;
+	wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+	wc.lpszClassName = L"RGuiAIStrip";
+	registered = RegisterClassW(&wc) != 0;
+	if (!registered) return NULL;
+    }
+    strip *s = (strip *) calloc(1, sizeof(strip));
+    if (!s) return NULL;
+    s->fn = fn;
+    s->hot_close = -1;
+    s->font = CreateFontW(-12, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0,
+			  CLEARTYPE_QUALITY, 0, L"Segoe UI");
+    HWND hw = CreateWindowExW(0, L"RGuiAIStrip", L"", WS_CHILD | WS_CLIPSIBLINGS,
+			      0, 0, 10, aiimg_strip_height(), parent, NULL, inst, NULL);
+    if (!hw) { if (s->font) DeleteObject(s->font); free(s); return NULL; }
+    SetWindowLongPtrW(hw, GWLP_USERDATA, (LONG_PTR) s);
+    return hw;
+}
+
+void aiimg_strip_set(HWND hw, char *const *urls, const char *const *labels, int n)
+{
+    strip *s = hw ? (strip *) GetWindowLongPtrW(hw, GWLP_USERDATA) : NULL;
+    if (!s) return;
+    strip_clear(s);
+    if (n > 16) n = 16;
+    for (int i = 0; i < n; i++) {
+	GpBitmap *b = bitmap_from_url(urls[i]);
+	UINT tw, th;
+	s->thumb[i] = b ? scaled((GpImage *) b, 2 * STRIP_ITEM, 2 * STRIP_TH, &tw, &th) : NULL;
+	if (b) GdipDisposeImage((GpImage *) b);
+	const char *l = labels[i] ? labels[i] : "";
+	int wn = MultiByteToWideChar(CP_UTF8, 0, l, -1, NULL, 0);
+	s->label[i] = (wchar_t *) calloc((size_t) (wn > 0 ? wn : 1), sizeof(wchar_t));
+	if (s->label[i]) MultiByteToWideChar(CP_UTF8, 0, l, -1, s->label[i], wn);
+    }
+    s->n = n;
+    s->hot_close = -1;
+    strip_layout(s);
+    InvalidateRect(hw, NULL, FALSE);
 }
