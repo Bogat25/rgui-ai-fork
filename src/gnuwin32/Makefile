@@ -80,7 +80,7 @@ endif
 
 dllversion-RESFLAGS = -I../include
 CSOURCES = \
-  aichat.c console.c dynload.c editor.c embeddedR.c extra.c \
+  aichat.c aiimage.c aiplot.c console.c dynload.c editor.c embeddedR.c extra.c \
   opt.c pager.c preferences.c psignal.c rhome.c rt_complete.c \
   rui.c run.c shext.c sys-win32.c system.c dos_wglob.c
 OBJS = $(CSOURCES:.c=.o) dllversion.o
@@ -91,9 +91,10 @@ EXTRALIBS = getline/gl.a ../extra/xdr/libxdr.a \
 
 ## For aichat.c: ws2_32 for HTTP to the local model server, winhttp and
 ## bcrypt for downloading the model on first use and checking its SHA-256.
+## For aiimage.c: gdiplus to read, scale and encode pictures for the model.
 R-DLLLIBS = $(OPENMP) -L. $(FLIBS) -lRblas -L../../$(IMPDIR) -lRgraphapp \
   -lRiconv -lcomctl32 -lole32 -luuid -lwinmm -lversion -ldeflate -lws2_32 \
-  -lwinhttp -lbcrypt \
+  -lwinhttp -lbcrypt -lgdiplus \
   $(LIBEXTRAS)
 
 

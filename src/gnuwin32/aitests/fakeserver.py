@@ -6,7 +6,7 @@ Exercises the parts of aichat.c that are easy to get wrong:
   - \\u escapes, including a surrogate pair
   - a role-only first delta whose "content" is null
 """
-import hashlib, io, json, socket, sys, threading, time
+import base64, hashlib, io, json, socket, sys, threading, time
 
 PORT = int(sys.argv[1])
 
@@ -86,6 +86,30 @@ def serve_file(conn, head, target):
             time.sleep(0.04)
 
 
+def message_parts(msg):
+    """Text and pictures of one message: content is a string, or a list
+    of parts in the OpenAI format when pictures are attached."""
+    c = msg.get("content") or ""
+    if isinstance(c, str):
+        return c, []
+    text = "".join(p.get("text", "") for p in c if p.get("type") == "text")
+    pics = [p["image_url"]["url"] for p in c if p.get("type") == "image_url"]
+    return text, pics
+
+
+def save_pictures(urls):
+    """Write the pictures of the last question to received-N.png|jpg and
+    a summary to received.txt, for the GUI test to look at."""
+    names = []
+    for i, url in enumerate(urls, 1):
+        head, _, data = url.partition(",")
+        ext = "jpg" if "jpeg" in head else "png"
+        name = "received-%d.%s" % (i, ext)
+        io.open(name, "wb").write(base64.b64decode(data))
+        names.append(name)
+    return names
+
+
 def sse_record(piece):
     if piece is None:
         delta = {"role": "assistant"}
@@ -144,7 +168,7 @@ def handle(conn):
         body += d
     req = json.loads(body.decode("utf-8"))
     sys.stderr.write("server: %d messages, system prompt %d chars\n"
-                     % (len(req["messages"]), len(req["messages"][0]["content"])))
+                     % (len(req["messages"]), len(message_parts(req["messages"][0])[0])))
 
     conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
                  b"Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
@@ -154,8 +178,17 @@ def handle(conn):
     if REPLAY:
         raw = io.open(REPLAY, "rb").read()
     else:
-        last = req["messages"][-1]["content"] if req.get("messages") else ""
-        pieces = PIECES_NOCODE if "NOCODE" in last else PIECES
+        msgs = req.get("messages") or []
+        last, pics = message_parts(msgs[-1]) if msgs else ("", [])
+        total = sum(len(message_parts(m)[1]) for m in msgs)
+        if pics or total:
+            names = save_pictures(pics)
+            io.open("received.txt", "w").write("last=%d total=%d %s\n" % (len(pics), total, " ".join(names)))
+            # A canned answer about the pictures, with the counts in it.
+            pieces = [None, "I can see ", "PICTURES last=%d total=%d" % (len(pics), total),
+                      ". It is **a plot** of six boxes."]
+        else:
+            pieces = PIECES_NOCODE if "NOCODE" in last else PIECES
         stream = "".join(sse_record(p) for p in pieces) + "data: [DONE]\n\n"
         raw = stream.encode("utf-8")
     i, size = 0, 7

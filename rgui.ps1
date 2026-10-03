@@ -21,7 +21,8 @@
     All commands:
 
         doctor    check prerequisites and show the state of everything
-        fetch     download into the cache (-NoModel skips the 2.7 GB model)
+        fetch     download into the cache (-NoModel skips the model and its
+                  picture reader, 3.4 GB)
         full      complete build; also the right choice after editing src/main
         quick     rebuild R.dll and the front-ends only (the fast path)
         run       start the built Rgui with the AI payload in place
@@ -102,6 +103,13 @@ $ModelFile   = 'Qwen3.5-4B-Q4_K_M.gguf'
 $ModelUrl    = "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/$ModelFile"
 $ModelSha256 = '00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4'
 $ModelSize   = 2740937888
+# The picture reader (multimodal projector) that goes with the model.
+# Saved under its own name: the upstream one, mmproj-F16.gguf, says
+# nothing about which model it belongs to.
+$VisionFile   = 'Qwen3.5-4B-mmproj-F16.gguf'
+$VisionUrl    = 'https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/mmproj-F16.gguf'
+$VisionSha256 = 'cd88edcf8d031894960bb0c9c5b9b7e1fea6ebee02b9f7ce925a00d12891f864'
+$VisionSize   = 672423616
 $LlamaRepo   = 'ggml-org/llama.cpp'
 
 # Everything that ends up in the installer is checked against these.
@@ -360,18 +368,18 @@ function Get-LlamaZip {
     return $zips[0].FullName
 }
 
-function Test-ModelFile([string]$Path) {
+function Test-ModelFile([string]$Path, [long]$Size = $ModelSize, [string]$Sha256 = $ModelSha256) {
     if (-not (Test-Path $Path)) { return $false }
     $item = Get-Item $Path
-    if ($item.Length -ne $ModelSize) { return $false }
+    if ($item.Length -ne $Size) { return $false }
     # Hashing 2.7 GB takes a while; remember a successful check.
     $ok = "$Path.sha256-ok"
     if ((Test-Path $ok) -and ((Get-Content $ok -Raw).Trim() -eq "$($item.Length) $($item.LastWriteTimeUtc.Ticks)")) {
         return $true
     }
-    Note 'verifying model checksum'
+    Note ('verifying {0}' -f [System.IO.Path]::GetFileName($Path))
     $hash = (Get-FileHash -Algorithm SHA256 $Path).Hash.ToLowerInvariant()
-    if ($hash -ne $ModelSha256) { return $false }
+    if ($hash -ne $Sha256) { return $false }
     Set-Content -Path $ok -Value "$($item.Length) $($item.LastWriteTimeUtc.Ticks)"
     return $true
 }
@@ -388,17 +396,23 @@ function Invoke-Fetch {
 
     Install-InnoSetup
 
-    if ($NoModel) { Note 'model: skipped (-NoModel)'; return }
-    $model = Join-Path $Cache $ModelFile
-    if (Test-ModelFile $model) { Note 'model: cached and verified'; return }
-    if (Test-Path $model) { Warn 'cached model is incomplete or corrupt; downloading again'; Remove-Item -Force $model }
-    Say "downloading $ModelFile (2.7 GB; resumable, rerun if interrupted)"
-    Get-Download $ModelUrl $model
-    if (-not (Test-ModelFile $model)) {
-        Remove-Item -Force $model
-        Stop-WithError 'the model download does not match the published SHA-256'
+    if ($NoModel) { Note 'model and picture reader: skipped (-NoModel)'; return }
+    Get-ModelFile $ModelUrl $ModelFile $ModelSize $ModelSha256 'model'
+    Get-ModelFile $VisionUrl $VisionFile $VisionSize $VisionSha256 'picture reader'
+}
+
+# A big file into the cache: resumable, then checked against its SHA-256.
+function Get-ModelFile([string]$Url, [string]$File, [long]$Size, [string]$Sha256, [string]$Label) {
+    $dest = Join-Path $Cache $File
+    if (Test-ModelFile $dest $Size $Sha256) { Note "$Label`: cached and verified"; return }
+    if (Test-Path $dest) { Warn "cached $Label is incomplete or corrupt; downloading again"; Remove-Item -Force $dest }
+    Say ("downloading {0} ({1:N1} GB; resumable, rerun if interrupted)" -f $File, ($Size / 1e9))
+    Get-Download $Url $dest
+    if (-not (Test-ModelFile $dest $Size $Sha256)) {
+        Remove-Item -Force $dest
+        Stop-WithError "the $Label download does not match the published SHA-256"
     }
-    Note 'model: downloaded and verified'
+    Note "$Label`: downloaded and verified"
 }
 
 # ---------------------------------------------------------------------
@@ -435,20 +449,25 @@ function Install-Payload {
         }
     }
 
-    $src = Join-Path $Cache $ModelFile
-    $dst = Join-Path $modelsDir $ModelFile
-    if (-not (Test-Path $src)) {
-        Warn "model not downloaded; the assistant will say the model is missing. Run '.\rgui fetch'."
-        return
-    }
-    if ((Test-Path $dst) -and (Get-Item $dst).Length -eq (Get-Item $src).Length) { return }
-    if (Test-Path $dst) { Remove-Item -Force $dst }
-    try {
-        # Same volume: a hard link costs no space and no time.
-        New-Item -ItemType HardLink -Path $dst -Target $src | Out-Null
-    } catch {
-        Say 'copying the model into the build tree'
-        Copy-Item $src $dst
+    foreach ($f in @(@{ file = $ModelFile; label = 'model' },
+                     @{ file = $VisionFile; label = 'picture reader' })) {
+        $src = Join-Path $Cache $f.file
+        $dst = Join-Path $modelsDir $f.file
+        if (-not (Test-Path $src)) {
+            if (-not (Test-Path $dst)) {
+                Warn "$($f.label) not downloaded; the assistant will offer to fetch it. Run '.\rgui fetch'."
+            }
+            continue
+        }
+        if ((Test-Path $dst) -and (Get-Item $dst).Length -eq (Get-Item $src).Length) { continue }
+        if (Test-Path $dst) { Remove-Item -Force $dst }
+        try {
+            # Same volume: a hard link costs no space and no time.
+            New-Item -ItemType HardLink -Path $dst -Target $src | Out-Null
+        } catch {
+            Say "copying the $($f.label) into the build tree"
+            Copy-Item $src $dst
+        }
     }
 }
 
@@ -547,6 +566,7 @@ function Invoke-GuiTests {
     $conf = Join-Path $Tree 'etc\Rai.conf'
     $backup = "$conf.gui-test-backup"
     $testModel = Join-Path $Tree 'ai\models\rgui-gui-test.gguf'
+    $testVision = Join-Path $Tree 'ai\models\rgui-gui-test-mmproj.gguf'
     $python = (Get-Command python -ErrorAction Stop).Source
     $server = Join-Path $Tree 'src\gnuwin32\aitests\fakeserver.py'
     $port = Get-FreePort
@@ -554,7 +574,7 @@ function Invoke-GuiTests {
     try { & $python $server $port --expected } finally { Pop-Location }
     $sha = (Get-Content (Join-Path $out 'download.sha256') -Raw).Trim()
     $size = [long](Get-Content (Join-Path $out 'download.size') -Raw).Trim()
-    foreach ($f in $testModel, "$testModel.part") { if (Test-Path $f) { [System.IO.File]::Delete($f) } }
+    foreach ($f in $testModel, "$testModel.part", $testVision, "$testVision.part") { if (Test-Path $f) { [System.IO.File]::Delete($f) } }
     Copy-Item $conf $backup -Force
     $srv = $null
     try {
@@ -563,19 +583,23 @@ function Invoke-GuiTests {
             'model = ai/models/rgui-gui-test.gguf',
             "model_url = http://127.0.0.1:$port/file/model.gguf?slow",
             "model_sha256 = $sha",
-            "model_bytes = $size")
+            "model_bytes = $size",
+            'vision_model = ai/models/rgui-gui-test-mmproj.gguf',
+            "vision_url = http://127.0.0.1:$port/file/vision.gguf?slow",
+            "vision_sha256 = $sha",
+            "vision_bytes = $size")
         $srv = Start-Process -FilePath $python -ArgumentList "`"$server`"", $port `
                              -WorkingDirectory $out -WindowStyle Hidden -PassThru
         if (-not (Wait-Port $port 15)) { Stop-WithError "fake server did not start on port $port" }
         $p = Start-DevRgui -NoPayload
         & $smoke -ProcessId $p.Id -ProbeDir $probe -TreeDir $Tree -ExpectDownload `
-                 -DownloadedModel $testModel -DownloadBytes $size
+                 -DownloadedModel $testModel -DownloadedVision $testVision -DownloadBytes $size
         $rc1b = $LASTEXITCODE
     } finally {
         Stop-DevProcesses
         if ($srv) { Stop-Process -Id $srv.Id -Force -ErrorAction SilentlyContinue }
         Move-Item -Force $backup $conf
-        foreach ($f in $testModel, "$testModel.part") { if (Test-Path $f) { [System.IO.File]::Delete($f) } }
+        foreach ($f in $testModel, "$testModel.part", $testVision, "$testVision.part") { if (Test-Path $f) { [System.IO.File]::Delete($f) } }
     }
     if ($rc1b -ne 0) { Stop-WithError "GUI test of the first-run download ($rc1b failed checks)" }
 
@@ -591,12 +615,14 @@ function Invoke-GuiTests {
             '', '## gui test overrides',
             "port = $port",
             'model = ai/system_prompt.txt',
-            'model_url =')
+            'model_url =',
+            'vision_model = ai/system_prompt.txt')
         $srv = Start-Process -FilePath $python -ArgumentList "`"$server`"", $port `
                              -WorkingDirectory $out -WindowStyle Hidden -PassThru
         if (-not (Wait-Port $port 15)) { Stop-WithError "fake server did not start on port $port" }
         $p = Start-DevRgui -NoPayload
-        & $smoke -ProcessId $p.Id -ProbeDir $probe -TreeDir $Tree -Canned
+        Get-ChildItem $out -Filter 'received*' -ErrorAction SilentlyContinue | ForEach-Object { [System.IO.File]::Delete($_.FullName) }
+        & $smoke -ProcessId $p.Id -ProbeDir $probe -TreeDir $Tree -Canned -ServerDir $out
         $rc1c = $LASTEXITCODE
     } finally {
         Stop-DevProcesses
@@ -666,14 +692,14 @@ function Invoke-Test {
     Say 'static checks (production flags; warnings in aichat.c are errors)'
     $sh = "cd $t && sh tools/GETVERSION > $i/Rversion.h && " +
               "cd src/gnuwin32 && " +
-              "gcc -fsyntax-only -O3 -Wall -pedantic -Werror $cflags aichat.c && " +
+              "gcc -fsyntax-only -O3 -Wall -pedantic -Werror $cflags aichat.c aiimage.c aiplot.c && " +
               "gcc -fsyntax-only -O3 -Wall -pedantic $cflags rui.c && " +
               "gcc -fsyntax-only -O3 -Wall -pedantic $cflags system.c && echo static-checks-ok"
     if ((Invoke-Bash $sh 'test-static') -ne 0) { Stop-WithError 'static checks' }
 
     Say 'building the test harness'
     $sh = "cd $t/src/gnuwin32/aitests && " +
-              "gcc -O1 -g -I. -I.. $cflags test_aichat.c -o $o/test_aichat.exe -lws2_32 -lwinhttp -lbcrypt -lgdi32"
+              "gcc -O1 -g -I. -I.. $cflags test_aichat.c ../aiimage.c -o $o/test_aichat.exe -lws2_32 -lwinhttp -lbcrypt -lgdi32 -lgdiplus -lole32 -lcomdlg32"
     if ((Invoke-Bash $sh 'test-build') -ne 0) { Stop-WithError 'test harness build' }
     $exe = Join-Path $out 'test_aichat.exe'
 
@@ -983,7 +1009,8 @@ function Invoke-Doctor {
     Say 'downloads'
     $items = @(
         @{ n = 'Tcl/Tk bundle'; p = (Join-Path $Cache $TclBundle) },
-        @{ n = 'model';         p = (Join-Path $Cache $ModelFile) })
+        @{ n = 'model';         p = (Join-Path $Cache $ModelFile) },
+        @{ n = 'picture reader'; p = (Join-Path $Cache $VisionFile) })
     foreach ($it in $items) {
         if (Test-Path $it.p) { Note ("{0,-14} ok" -f $it.n) } else { Note ("{0,-14} missing" -f $it.n) }
     }

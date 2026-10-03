@@ -25,7 +25,11 @@ param(
     # answers prose for NOCODE questions and code otherwise.
     [switch]$Canned,
     [string]$DownloadedModel = '',
-    [long]$DownloadBytes = 0
+    [string]$DownloadedVision = '',
+    [long]$DownloadBytes = 0,
+
+    # Where the fake server saves the pictures it receives (canned pass).
+    [string]$ServerDir = ''
 )
 
 Set-StrictMode -Version 2.0
@@ -366,8 +370,24 @@ $send = $buttons['Send']; $stop = $buttons['Stop']
 Check 'transcript shows the welcome text' (([Win]::Text($hist)) -like '*Local R assistant*')
 
 # The status line is the panel's GraphApp label, window class "Rgui".
-$statusLabel = [Win]::Descendants($panel) | Where-Object { [Win]::ClassOf($_) -eq 'Rgui' } | Select-Object -First 1
+$statusLabel = [Win]::Descendants($panel) | Where-Object { [Win]::ClassOf($_) -eq 'Rgui' -and [Win]::IsWindowVisible($_) } | Select-Object -First 1
 function Status { if ($statusLabel) { return [string]([Win]::Text($statusLabel)) } else { return '' } }
+# The "Attached picture: ..." line above the question box, when shown.
+function Attach-Text {
+    foreach ($h in [Win]::Descendants($panel)) {
+        if ($h -eq $statusLabel -or [Win]::ClassOf($h) -ne 'Rgui' -or -not [Win]::IsWindowVisible($h)) { continue }
+        $t = [string]([Win]::Text($h))
+        if ($t.StartsWith('Attached')) { return $t }
+    }
+    return ''
+}
+# Draw a plot at the console and wait for its window.
+function Draw-Plot {
+    if (-not (Set-Clip "boxplot(len ~ supp * dose, data = ToothGrowth, col = c('orange', 'skyblue'))`n")) { return $false }
+    Start-Sleep -Milliseconds 400
+    Post-Command $script:PasteCmd
+    return (Wait-Until { (Find-ByText $frame 'R Graphics') -ne [IntPtr]::Zero } 20)
+}
 
 if (-not $WithModel -and -not $Canned) {
     # No model on disk: the first open offers to download it.
@@ -390,6 +410,11 @@ if (-not $WithModel -and -not $Canned) {
         if (Test-Path $DownloadedModel) { $len = (Get-Item $DownloadedModel).Length }
         Check 'model file in place with the published size' ($len -eq $DownloadBytes) "size: $len"
         Check 'no .part file left behind' (-not (Test-Path "$DownloadedModel.part"))
+        if ($DownloadedVision) {
+            $vlen = -1
+            if (Test-Path $DownloadedVision) { $vlen = (Get-Item $DownloadedVision).Length }
+            Check 'the picture reader arrives with the model' ($vlen -eq $DownloadBytes) "size: $vlen"
+        }
         # The test file is not a real model, so the server must refuse it
         # and the status line must say why.
         Check 'a bad model file is reported in the status line' `
@@ -420,6 +445,10 @@ $panelToggle = [Win]::FindCommand($bar, 'AI assistant', [ref]$ptop)
 $attErr = [Win]::FindCommand($bar, 'Last error from the console', [ref]$ptop)
 $attScript = [Win]::FindCommand($bar, 'Current script', [ref]$ptop)
 $attCon = [Win]::FindCommand($bar, 'Recent console output', [ref]$ptop)
+$attPlot = [Win]::FindCommand($bar, 'Current plot', [ref]$ptop)
+$attClip = [Win]::FindCommand($bar, 'Picture from the clipboard', [ref]$ptop)
+$attRemove = [Win]::FindCommand($bar, 'Remove pictures', [ref]$ptop)
+$panelPaste = [Win]::FindCommand($bar, 'Paste', [ref]$ptop)
 
 if (-not $WithModel -and -not $Canned) {
     Post-Command $panelToggle
@@ -500,6 +529,58 @@ if ($Canned) {
     $edText = (@([Win]::Descendants($ed) | ForEach-Object { [Win]::Text($_) }) -join "`n")
     $n = ([regex]::Matches($edText, [regex]::Escape('t.test('))).Count
     Check 'the script now holds the code twice' ($n -ge 2) "t.test( occurs $n times"
+
+    # Pictures.  The plot window is drawn under the panel on purpose: what
+    # is sent must be the plot, not whatever covers it.
+    Check 'Attach menu has Current plot, Picture file and the clipboard' `
+          ($attPlot -ge 0 -and $attClip -ge 0 -and $attRemove -ge 0)
+    Post-Command $attPlot
+    Check 'Current plot with no plot says so' (Wait-Until { (Status) -like '*No plot window*' } 5) "status: $(Status)"
+    Check 'a plot is drawn at the console' (Draw-Plot)
+    Post-Command $attPlot
+    Check 'Current plot attaches it' (Wait-Until { (Attach-Text) -like 'Attached picture: plot, device*' } 10) "attach line: $(Attach-Text)  status: $(Status)"
+    Check 'the picture goes with the question' (Ask 'What kind of plot is this?')
+    $ht = [string]([Win]::Text($hist))
+    Check 'the transcript names the picture' ($ht.Contains('Picture: plot, device'))
+    Check 'the server got one picture' ($ht.Contains('PICTURES last=1 total=1')) "tail: $($ht.Substring([Math]::Max(0, $ht.Length - 200)))"
+    Check 'the attached line goes once it is sent' ((Attach-Text) -eq '')
+    $recv = Join-Path $ServerDir 'received-1.png'
+    $orange = 0; $blue = 0
+    if (Test-Path $recv) {
+        Add-Type -AssemblyName System.Drawing
+        $bmp = [System.Drawing.Bitmap]::FromFile($recv)
+        for ($y = 0; $y -lt $bmp.Height; $y += 3) {
+            for ($x = 0; $x -lt $bmp.Width; $x += 3) {
+                $c = $bmp.GetPixel($x, $y)
+                if ($c.R -gt 230 -and $c.G -gt 140 -and $c.G -lt 190 -and $c.B -lt 60) { $orange++ }
+                elseif ($c.R -gt 110 -and $c.R -lt 160 -and $c.G -gt 190 -and $c.B -gt 215) { $blue++ }
+            }
+        }
+        $bmp.Dispose()
+    }
+    Check 'the picture sent is the plot itself, not what covers it' ($orange -gt 200 -and $blue -gt 200) "orange $orange, sky blue $blue samples"
+    Check 'a follow-up still carries the picture' (Ask 'And which box is highest?')
+    $ht = [string]([Win]::Text($hist))
+    Check 'the server got it again with the follow-up' ($ht.Contains('PICTURES last=0 total=1'))
+
+    # A screenshot on the clipboard, pasted into the question box.
+    Add-Type -AssemblyName System.Windows.Forms
+    $img = New-Object System.Drawing.Bitmap 240, 120
+    $g = [System.Drawing.Graphics]::FromImage($img)
+    $g.Clear([System.Drawing.Color]::White)
+    $g.FillRectangle([System.Drawing.Brushes]::Red, 20, 20, 100, 60)
+    $g.Dispose()
+    $put = $false
+    for ($i = 0; $i -lt 20 -and -not $put; $i++) {
+        try { [System.Windows.Forms.Clipboard]::SetImage($img); $put = $true } catch { Start-Sleep -Milliseconds 100 }
+    }
+    $img.Dispose()
+    Start-Sleep -Milliseconds 400
+    Post-Command $panelPaste
+    Check 'Paste with a picture on the clipboard attaches it' `
+          (Wait-Until { (Attach-Text) -like '*picture from the clipboard (240 x 120)*' } 10) "attach line: $(Attach-Text)  status: $(Status)"
+    Post-Command $attRemove
+    Check 'Remove pictures drops it' (Wait-Until { (Attach-Text) -eq '' -and (Status) -like 'Pictures removed*' } 5) "status: $(Status)"
 
     Stop-Process -Id $ProcessId -Force
     if ($savedClipboard) { [void](Set-Clip $savedClipboard) }
@@ -593,6 +674,21 @@ if ($WithModel) {
     Toggle; $null = Wait-Until { -not [Win]::IsWindowVisible($panel) } 5
     Toggle; $null = Wait-Until { [Win]::IsWindowVisible($panel) } 5
     Check 'hiding and reopening keeps the conversation' ([Win]::Text($hist) -eq $before)
+
+    # A plot for the real model.
+    Check 'a plot is drawn at the console' (Draw-Plot)
+    Post-Command $attPlot
+    Check 'Current plot attaches it' (Wait-Until { (Attach-Text) -like 'Attached picture: plot*' } 10) "status: $(Status)"
+    [void][Win]::SetText($inbox, 'What kind of plot is this? Answer in one sentence.')
+    [void][Win]::Click($send)
+    $null = Wait-Until { -not [Win]::IsWindowEnabled($send) } 10
+    $done3 = Wait-Until { [Win]::IsWindowEnabled($send) } $AnswerTimeout
+    $text3 = [Win]::Text($hist)
+    $at3 = $text3.LastIndexOf('R assistant')
+    $reply3 = ''
+    if ($at3 -ge 0) { $reply3 = $text3.Substring($at3 + 11).Trim() }
+    Check 'the model answers about the picture' $done3
+    Check 'and recognises the boxplot' ($reply3 -match '(?i)box') "reply: $reply3"
 } else {
     # No model on disk: Send offers the download again instead of failing.
     [void][Win]::SetText($inbox, $question)

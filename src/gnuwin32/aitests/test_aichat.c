@@ -41,6 +41,8 @@ char *editor_top_text(char *t, size_t n) { (void)t; (void)n; return NULL; }
 int   editor_insert_top(const char *x, char *t, size_t n) { (void)x; (void)t; (void)n; return 0; }
 textbox GA_newrichtextarea(const char *t, rect r) { (void)t; (void)r; return STUB; }
 int pointsize = 10;
+unsigned char *aiplot_pixels(HWND h, int n, int *w, int *hh, int *s)
+{ (void)h; (void)n; (void)w; (void)hh; (void)s; return NULL; }
 
 /* ---- assertions -------------------------------------------------- */
 static int failures = 0;
@@ -302,6 +304,163 @@ static void test_question_box(void)
 
     g_hinput = NULL;
     DestroyWindow(h);
+}
+
+
+/* ---- pictures ------------------------------------------------------ */
+
+/* w x h BGRX pixels: white, a red block, and -- if noisy -- speckle, so
+   that PNG cannot compress it (a stand-in for a photo). */
+static unsigned char *make_pixels(int w, int h, int noisy)
+{
+    unsigned char *px = (unsigned char *) malloc((size_t) w * h * 4);
+    unsigned seed = 12345;
+    for (int y = 0; px && y < h; y++)
+        for (int x = 0; x < w; x++) {
+            unsigned char *q = px + ((size_t) y * w + x) * 4;
+            int block = x > w / 4 && x < w / 2 && y > h / 4 && y < h / 2;
+            q[0] = block ? 0 : 255; q[1] = block ? 0 : 255; q[2] = 255; q[3] = 0;
+            if (noisy) {
+                seed = seed * 1103515245u + 12345u;
+                q[0] = (unsigned char) (seed >> 16); q[1] = (unsigned char) (seed >> 8);
+            }
+        }
+    return px;
+}
+
+static int b64v(char c)
+{
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    return c == '+' ? 62 : c == '/' ? 63 : -1;
+}
+
+/* The bytes of a data URL (malloc'd). */
+static unsigned char *url_bytes(const char *url, size_t *n)
+{
+    *n = 0;
+    const char *b = url ? strchr(url, ',') : NULL;
+    if (!b) return NULL;
+    unsigned char *out = (unsigned char *) malloc(strlen(b));
+    int acc = 0, bits = 0;
+    for (b++; out && *b && *b != '='; b++) {
+        int v = b64v(*b);
+        if (v < 0) continue;
+        acc = (acc << 6) | v; bits += 6;
+        if (bits >= 8) { bits -= 8; out[(*n)++] = (unsigned char) ((acc >> bits) & 0xFF); }
+    }
+    return out;
+}
+
+/* Width and height from a PNG's IHDR; 0 when it is not a PNG. */
+static void png_dims(const unsigned char *p, size_t n, int *w, int *h)
+{
+    *w = *h = 0;
+    if (n < 24 || memcmp(p, "\x89PNG\r\n\x1a\n", 8)) return;
+    *w = (p[16] << 24) | (p[17] << 16) | (p[18] << 8) | p[19];
+    *h = (p[20] << 24) | (p[21] << 16) | (p[22] << 8) | p[23];
+}
+
+static int count_of(const char *hay, const char *needle)
+{
+    int n = 0;
+    for (const char *q = hay; (q = strstr(q, needle)); q += strlen(needle)) n++;
+    return n;
+}
+
+static void test_pictures(void)
+{
+    int w = 0, h = 0, pw = 0, ph = 0;
+    size_t n = 0;
+    unsigned char *px = make_pixels(300, 200, 0);
+    char *url = aiimg_from_pixels(px, 300, 200, 300 * 4, 1600, &w, &h);
+    unsigned char *bytes = url_bytes(url, &n);
+    png_dims(bytes, n, &pw, &ph);
+    t_ok("pictures: a plot-like picture becomes a PNG data URL",
+         url && !strncmp(url, "data:image/png;base64,", 22));
+    t_ok("pictures: small ones keep their size", w == 300 && h == 200 && pw == 300 && ph == 200);
+
+    /* the same PNG through a file */
+    char tmp[MAX_PATH], path[MAX_PATH + 32];
+    GetTempPathA(MAX_PATH, tmp);
+    snprintf(path, sizeof path, "%srgui-ai-test.png", tmp);
+    FILE *f = fopen(path, "wb");
+    if (f) { fwrite(bytes, 1, n, f); fclose(f); }
+    wchar_t *wpath = u8_to_wcs(path);
+    char *url2 = aiimg_from_file(wpath, 1600, &w, &h);
+    t_ok("pictures: a PNG file is read", url2 && w == 300 && h == 200);
+    free(url2); free(url); free(bytes); free(px);
+
+    px = make_pixels(4000, 1000, 0);
+    url = aiimg_from_pixels(px, 4000, 1000, 4000 * 4, 1600, &w, &h);
+    bytes = url_bytes(url, &n);
+    png_dims(bytes, n, &pw, &ph);
+    t_ok("pictures: wide ones are scaled to 1600 across", w == 1600 && h == 400 && pw == 1600 && ph == 400);
+    free(url); free(bytes); free(px);
+
+    px = make_pixels(500, 3000, 0);
+    url = aiimg_from_pixels(px, 500, 3000, 500 * 4, 1600, &w, &h);
+    t_ok("pictures: tall ones are scaled to 1600 high", w == 267 && h == 1600);
+    free(url); free(px);
+
+    px = make_pixels(1500, 1100, 1);
+    url = aiimg_from_pixels(px, 1500, 1100, 1500 * 4, 1600, &w, &h);
+    t_ok("pictures: a photo-like picture goes as JPEG",
+         url && !strncmp(url, "data:image/jpeg;base64,", 23));
+    t_ok("pictures: and stays small", url && strlen(url) < 2 * 1024 * 1024);
+    free(url); free(px);
+
+    f = fopen(path, "wb");
+    if (f) { fputs("not a picture", f); fclose(f); }
+    url = aiimg_from_file(wpath, 1600, &w, &h);
+    t_ok("pictures: a file that is not a picture gives nothing", url == NULL);
+    free(url);
+    DeleteFileA(path);
+    free(wpath);
+
+    /* The request: pictures first, then the words, in the OpenAI format. */
+    aiconf saved = CFG;
+    CFG.vision = 1;
+    GetModuleFileNameA(NULL, CFG.vision_model, MAX_PATH);    /* a file that exists */
+    conv_clear();
+    g_pimg[0] = xstrdup("data:image/png;base64,QUJD");
+    snprintf(g_pimg_label[0], sizeof g_pimg_label[0], "plot");
+    g_npimg = 1;
+    char *req = ai_build_request("what is this?");
+    t_ok("pictures: the question carries its picture, then its text",
+         req && strstr(req, "\"content\":[{\"type\":\"image_url\",\"image_url\":"
+                            "{\"url\":\"data:image/png;base64,QUJD\"}},"
+                            "{\"type\":\"text\",\"text\":\"what is this?\"}]"));
+    free(req);
+
+    /* Earlier pictures stay for follow-ups while they fit (4 per request). */
+    char **three = (char **) malloc(3 * sizeof(char *));
+    for (int i = 0; i < 3; i++) three[i] = xstrdup("data:image/png;base64,T0xE");
+    conv_add_imgs("user", "three pictures", three, 3);
+    conv_add("assistant", "seen them");
+    req = ai_build_request("and now?");          /* 1 new + 3 old = 4 */
+    t_ok("pictures: earlier pictures are resent for a follow-up",
+         req && count_of(req, "\"type\":\"image_url\"") == 4);
+    free(req);
+    g_pimg[1] = xstrdup("data:image/png;base64,QUJD");
+    g_npimg = 2;                                  /* 2 new + 3 old = 5: too many */
+    req = ai_build_request("and these?");
+    t_ok("pictures: at most 4 go in one request",
+         req && count_of(req, "\"type\":\"image_url\"") == 2);
+    t_ok("pictures: one that no longer fits leaves a note",
+         req && strstr(req, "three pictures\\n[A picture was attached here"));
+    free(req);
+    CFG.vision = 0;                               /* no picture reader */
+    g_npimg = 0;
+    req = ai_build_request("text only");
+    t_ok("pictures: without the reader no picture is sent",
+         req && count_of(req, "image_url") == 0);
+    free(req);
+    free(g_pimg[0]); free(g_pimg[1]);
+    g_pimg[0] = g_pimg[1] = NULL;
+    conv_clear();
+    CFG = saved;
 }
 
 static void test_find_error(void)
@@ -572,6 +731,53 @@ static void test_download(int port)
     free(sz);
 }
 
+
+/* The worker fetches the model and the picture reader in one go, or the
+   reader alone when the model is already there. */
+static void test_download_both(int port)
+{
+    char cwd[MAX_PATH], url[128], vurl[128];
+    GetCurrentDirectoryA(MAX_PATH, cwd);
+    char *sha = read_small("download.sha256");
+    char *sz = read_small("download.size");
+    long long size = sz ? atoll(sz) : 0;
+    if (!sha || size <= 0) { free(sha); free(sz); return; }
+    aiconf saved = CFG;
+    snprintf(url, sizeof url, "http://127.0.0.1:%d/file/model.gguf", port);
+    snprintf(vurl, sizeof vurl, "http://127.0.0.1:%d/file/vision.gguf", port);
+    snprintf(CFG.model, sizeof CFG.model, "%s\\dl-model.gguf", cwd);
+    snprintf(CFG.vision_model, sizeof CFG.vision_model, "%s\\dl-vision.gguf", cwd);
+    snprintf(CFG.model_url, sizeof CFG.model_url, "%s", url);
+    snprintf(CFG.vision_url, sizeof CFG.vision_url, "%s", vurl);
+    snprintf(CFG.model_sha256, sizeof CFG.model_sha256, "%s", sha);
+    snprintf(CFG.vision_sha256, sizeof CFG.vision_sha256, "%s", sha);
+    CFG.model_bytes = CFG.vision_bytes = size;
+    CFG.vision = 1;
+    DeleteFileA(CFG.model); DeleteFileA(CFG.vision_model);
+    InterlockedExchange(&g_cancel, 0);
+
+    ai_download_worker(NULL);
+    t_ok("download: model and picture reader in one go",
+         file_len(CFG.model) == size && file_len(CFG.vision_model) == size);
+
+    DeleteFileA(CFG.vision_model);
+    write_small("last_range.txt", "untouched");
+    ai_download_worker(NULL);
+    char *rng = read_small("last_range.txt");
+    t_ok("download: an existing model gets the picture reader alone",
+         file_len(CFG.vision_model) == size && rng && !strcmp(rng, "none"));
+    free(rng);
+
+    /* The worker reports to the panel; there is none here. */
+    MSG m;
+    while (PeekMessage(&m, g_msgwin, WM_AI_STATUS, WM_AI_DLDONE, PM_REMOVE))
+        if (m.message == WM_AI_STATUS) free((void *) m.lParam);
+    DeleteFileA(CFG.model); DeleteFileA(CFG.vision_model);
+    CFG = saved;
+    free(sha);
+    free(sz);
+}
+
 /* ---- against the real model -------------------------------------- */
 
 /* Drives the production path end to end: ai_worker() finds no server,
@@ -588,6 +794,13 @@ static int test_real(const char *exe, const char *model, int port,
     CFG.request_timeout = 600;
     CFG.n_predict = 256;
     snprintf(CFG.extra_args, sizeof CFG.extra_args, "%s", extra);  /* default: empty */
+    /* The picture reader, as Rgui finds it: beside the model. */
+    snprintf(CFG.vision_model, sizeof CFG.vision_model, "%s", model);
+    {
+        char *sl = strrchr(CFG.vision_model, '\\');
+        if (sl) snprintf(sl + 1, sizeof CFG.vision_model - (size_t) (sl + 1 - CFG.vision_model),
+                         "Qwen3.5-4B-mmproj-F16.gguf");
+    }
 
     char ai[MAX_PATH];
     snprintf(ai, sizeof ai, "%s", exe);
@@ -648,6 +861,56 @@ static int test_real(const char *exe, const char *model, int port,
     free(code);
     free(got);
 
+    /* A picture: the number 42, drawn large.  Only when the picture
+       reader sits next to the model. */
+    if (ai_vision_ready()) {
+        t_ok("real model: started with the picture reader", g_srv_vision != 0);
+        BITMAPINFO bi;
+        memset(&bi, 0, sizeof bi);
+        bi.bmiHeader.biSize = sizeof bi.bmiHeader;
+        bi.bmiHeader.biWidth = 400;
+        bi.bmiHeader.biHeight = -200;
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        void *bits = NULL;
+        HDC dc = CreateCompatibleDC(NULL);
+        HBITMAP hb = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+        HGDIOBJ old = SelectObject(dc, hb);
+        RECT rc = { 0, 0, 400, 200 };
+        FillRect(dc, &rc, (HBRUSH) GetStockObject(WHITE_BRUSH));
+        HFONT fnt = CreateFontW(-150, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET,
+                                0, 0, 0, 0, L"Arial");
+        HGDIOBJ oldf = SelectObject(dc, fnt);
+        SetBkMode(dc, TRANSPARENT);
+        DrawTextW(dc, L"42", -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        GdiFlush();
+        int w = 0, h = 0;
+        g_pimg[0] = aiimg_from_pixels((unsigned char *) bits, 400, 200, 400 * 4, 1600, &w, &h);
+        g_npimg = g_pimg[0] ? 1 : 0;
+        SelectObject(dc, oldf); DeleteObject(fnt);
+        SelectObject(dc, old); DeleteObject(hb); DeleteDC(dc);
+
+        conv_clear();
+        t0 = GetTickCount();
+        req = ai_build_request("What number is written in the picture? "
+                               "Answer with the number only.");
+        InterlockedExchange(&g_req_images, g_npimg);
+        ai_worker(req);
+        secs = (GetTickCount() - t0) / 1000.0;
+        ai_lock();
+        got = g_pending.n ? db_release(&g_pending) : NULL;
+        ai_unlock();
+        while (PeekMessage(&m, NULL, 0, 0, PM_REMOVE)) DispatchMessage(&m);
+        printf("---- picture answer (%.1f s) ----\n%s\n--------------------------------\n",
+               secs, got ? got : "(nothing)");
+        t_ok("real model: reads the number in a picture", got && strstr(got, "42"));
+        free(got);
+        free(g_pimg[0]);
+        g_pimg[0] = NULL;
+        g_npimg = 0;
+    } else
+        printf("(no picture reader next to the model: picture test skipped)\n");
+
     ai_server_stop();
     t_ok("real model: server stopped", g_srv_proc == NULL);
 
@@ -678,6 +941,7 @@ int main(int argc, char **argv)
     test_request_shape();
     test_transcript();
     test_question_box();
+    test_pictures();
 
     if (argc > 2) {
         /* argv[1] = port, argv[2] = file holding the expected answer */
@@ -692,6 +956,7 @@ int main(int argc, char **argv)
         test_cancel(port);
         test_no_server();
         test_download(port);
+        test_download_both(port);
     }
 
     printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "PASSED",

@@ -18,14 +18,15 @@ E:\
         ├── system_prompt.txt         standing instructions
         ├── context\                  your course material
         ├── llama\                    llama-server.exe and its DLLs
-        └── models\                   the .gguf file
+        └── models\                   the model and its picture reader
 ```
 
 `ai\` is created by the build, with `system_prompt.txt` and
 `context\README.txt` in it. You fill `llama\`, `models\` and `context\`.
 
 Budget on a 128 GB stick: R about 300 MB, llama.cpp about 60 MB, the
-model 2.7 GB. Everything else is free space.
+model 2.7 GB and its picture reader 0.7 GB. Everything else is free
+space.
 
 ## 2. Build it: the pipeline
 
@@ -37,8 +38,8 @@ rights. No `MkRules.local` is needed with Rtools45.
 
 ```
 rgui doctor           what is installed, downloaded and built
-rgui fetch            Tcl/Tk bundle, llama.cpp, and the model (2.7 GB,
-                      SHA-256 checked, resumable)
+rgui fetch            Tcl/Tk bundle, llama.cpp, the model and its picture
+                      reader (3.4 GB, SHA-256 checked, resumable)
 rgui full             build R, base and recommended packages
 rgui test -Real -Gui  every test there is, see below
 rgui package          assemble the stick layout in D:\rgui-build\dist
@@ -71,9 +72,9 @@ say), use `rgui full` instead; it is incremental too.
 
 | Command | What it proves | Time |
 |---|---|---|
-| `rgui test` | `aichat.c` compiles warning-free with the production flags; JSON, SSE, chunked HTTP, the `<think>` filter, Stop and a missing server behave; captured real `llama-server` output parses correctly; on real RichEdit controls, Markdown renders without its markup, emoji and characters Consolas lacks get fonts that have them, and typed or set text in any script arrives whole | ~10 s |
-| `rgui test -Real` | `aichat.c` starts the real `llama-server` itself, the model loads, answers with a fenced code block, and the server is stopped again | ~30 s |
-| `rgui test -Gui` | drives the built `Rgui.exe` through window messages: menu entry, panel, all buttons, hide/show/close, Copy code, To editor, R running console code **while** the model answers, the first-run download offer and the download itself, a missing model failing politely, the panel's full menu bar with Ctrl+T, the Attach menu, answers without code (reported, clipboard untouched), To editor into an already open script, a question in Hungarian, Greek, Chinese and emoji reaching the transcript unchanged, answers shown without their Markdown code fences, and `llama-server` dying with Rgui | ~2–3 min |
+| `rgui test` | `aichat.c` compiles warning-free with the production flags; JSON, SSE, chunked HTTP, the `<think>` filter, Stop and a missing server behave; captured real `llama-server` output parses correctly; on real RichEdit controls, Markdown renders without its markup, emoji and characters Consolas lacks get fonts that have them, typed or set text in any script arrives whole; pictures are scaled and encoded (JPEG for photos), go into the request before the question, stay for follow-ups up to 4 per request and are left out without the picture reader; the model and the picture reader download in one go, or the reader alone | ~10 s |
+| `rgui test -Real` | `aichat.c` starts the real `llama-server` itself (with the picture reader), the model loads, answers with a fenced code block, reads the number in a picture, and the server is stopped again | ~1 min |
+| `rgui test -Gui` | drives the built `Rgui.exe` through window messages: menu entry, panel, all buttons, hide/show/close, Copy code, To editor, R running console code **while** the model answers, the first-run download offer and the download itself, a missing model failing politely, the panel's full menu bar with Ctrl+T, the Attach menu, answers without code (reported, clipboard untouched), To editor into an already open script, a question in Hungarian, Greek, Chinese and emoji reaching the transcript unchanged, answers shown without their Markdown code fences, Attach > Current plot sending the plot itself even with the panel covering it (checked by its colours, as the fake server received it), a follow-up still carrying the picture, a screenshot pasted from the clipboard, Remove pictures, the real model recognising a boxplot, and `llama-server` dying with Rgui | ~3–4 min |
 | `rgui test -Installer` | installs the last built setup.exe into a folder whose name has a space in it, starts RGui from the Start-menu launcher, upgrades over it (your `Rai.conf`, prompt and notes must survive) and uninstalls it (the program and model go, your `work` folder stays) | ~1 min |
 
 When something fails, the script prints the first error lines of the
@@ -89,10 +90,12 @@ clipboard for the Copy code check and puts your text back afterwards.
 | File | Change |
 |---|---|
 | `src/gnuwin32/aichat.c`, `aichat.h` | new, the whole feature |
+| `src/gnuwin32/aiimage.c`, `aiimage.h` | new, pictures: files, the clipboard, scaling and encoding (GDI+) |
+| `src/gnuwin32/aiplot.c` | new, reads a plot from its windows() device, as `savePlot()` does |
 | `src/gnuwin32/rui.c` | one menu entry in the Misc menu |
 | `src/gnuwin32/system.c` | one call to `aichat_shutdown()` on exit |
-| `src/gnuwin32/Makefile` | `aichat.c` in `CSOURCES`, `-lws2_32` |
-| `src/gnuwin32/Rdll.hide` | keeps the four new symbols out of R.dll's exports |
+| `src/gnuwin32/Makefile` | the three files in `CSOURCES`; `-lws2_32 -lwinhttp -lbcrypt -lgdiplus` |
+| `src/gnuwin32/Rdll.hide` | keeps the new symbols out of R.dll's exports |
 | `src/gnuwin32/fixed/Makefile` | installs `ai\` |
 | `src/gnuwin32/fixed/etc/Rai.conf` | new, the settings file |
 | `src/gnuwin32/fixed/ai/` | new, templates |
@@ -109,7 +112,9 @@ under `-j`, the second races the first and fails.
 Then put a llama.cpp Windows CPU build (`llama-<build>-bin-win-cpu-x64.zip`
 from its GitHub releases; **all** the DLLs next to `llama-server.exe`)
 into `R\ai\llama\`, and `Qwen3.5-4B-Q4_K_M.gguf` from
-`unsloth/Qwen3.5-4B-GGUF` on Hugging Face into `R\ai\models\`.
+`unsloth/Qwen3.5-4B-GGUF` on Hugging Face into `R\ai\models\`, with
+`mmproj-F16.gguf` from the same page saved there as
+`Qwen3.5-4B-mmproj-F16.gguf` (the picture reader).
 Check the server once with `R\ai\llama\llama-server.exe --version`.
 
 ## 4. Releases
@@ -152,7 +157,10 @@ time; *More info > Run anyway*.
 It is not in the installer: at 2.7 GB it would exceed GitHub's 2 GB
 limit for release files, and it would make every update 2.7 GB. The
 first time the assistant is opened without it, RGui asks whether to
-download it. The download runs in the background (R stays usable, the
+download it, together with its picture reader (3.4 GB in all). An
+install that already has the model is offered the picture reader alone
+(0.7 GB) the next time the panel opens; saying no keeps the assistant
+text-only and asks again when a picture is attached. The download runs in the background (R stays usable, the
 status line shows progress, Stop pauses it), continues where it stopped
 if interrupted, uses the machine's proxy settings, and the file is only
 used once its SHA-256 matches the one in `Rai.conf`. After that,
@@ -160,13 +168,28 @@ everything works offline. `model_url =` (empty) in `Rai.conf` turns the
 offer off; the model can then be copied into `R\ai\models\` by hand.
 
 Qwen3.5-4B Q4_K_M is 2.7 GB on disk and needs roughly 3.5–4 GB of RAM at
-`ctx_size = 8192`, which is comfortable on a 16 GB machine. If you use a
+`ctx_size = 8192`; the picture reader adds about 1.6 GB while the
+assistant runs, about 5 GB in all, which is comfortable on a 16 GB
+machine. `vision = no` in `Rai.conf` leaves the reader out. If you use a
 file with a different name, point `model =` in `R\etc\Rai.conf` at it.
 
 Expect something like 5–12 tokens per second on an i5 with no GPU: a
 paragraph of explanation plus a short code block takes well under a
 minute. The first load after plugging the stick in is the slow part,
-because 2.7 GB has to come off USB.
+because 3.4 GB has to come off USB.
+
+### Pictures
+
+Reading a picture is the slow part on a CPU: the model looks at it
+before it writes anything. Measured on a 13th-generation i7 limited to
+4 threads, a plot took 11 s and an error screenshot 7 s at the default
+`image_max_tokens = 256`; on an older i5, expect 20–30 s. Text-only
+answers are as fast as before. Plots are taken from the graphics
+device's own bitmap, as `savePlot()` does, so the plot window may be
+covered by the panel or anything else. Pictures stay in the
+conversation for follow-up questions (at most 4 per request); llama.cpp
+reuses what it has already read of them, so a follow-up costs little
+extra.
 
 ## 6. Add the course material
 
@@ -183,8 +206,9 @@ No indexing step, no restart: edit a file, ask the next question.
 1. Copy `E:\R\ai\Start-R.cmd` to `E:\Start-R.cmd`.
 2. Double-click it. RGui opens exactly as it always does.
 3. **Misc → AI assistant**, or Ctrl+T.
-4. Without the model, RGui offers to download it (2.7 GB, once). Say Yes
-   and keep working in R; the status line shows the progress.
+4. Without the model, RGui offers to download it with its picture
+   reader (3.4 GB, once). Say Yes and keep working in R; the status line
+   shows the progress.
 5. The status line then says `Loading the model...` for a minute or two
    the first time, then `Ready.`
 6. Ask something, in any language: accents, Greek, maths symbols,
@@ -193,7 +217,13 @@ No indexing step, no restart: edit a file, ask the next question.
    bullets. Pasting into the question box always pastes plain text.
    **Attach** (in the panel's menu bar) adds your last
    console error, your current script or recent console output to the
-   question, where you can edit it before sending.
+   question, where you can edit it before sending. It also takes
+   pictures: **Current plot** (the plot window as R drew it), **Picture
+   file...**, or **Picture from the clipboard**; Ctrl+V of a screenshot
+   (Windows+Shift+S) or of picture files copied in Explorer does the
+   same. An "Attached picture" line above the question box shows what
+   goes with the next question; **Remove pictures** drops it. A picture
+   with no question asks what it shows.
 7. Use **Copy code**, or **To editor**, which inserts the code at the
    cursor of the script you have open (Ctrl+Z undoes it) or opens a new
    one. Answers without a code block are reported rather than copied.
@@ -209,7 +239,10 @@ it. The console, the editor, graphics and packages keep working.
 | Status line says | Do this |
 |---|---|
 | `The model server was not found` | Check `server_exe` in `etc\Rai.conf` and that `llama-server.exe` really is in `ai\llama\`. |
-| `Not enough free space for the AI model` | The drive needs 2.7 GB free (less if part of the download is already there). |
+| `Not enough free space for the AI model` | The drive needs 3.4 GB free, 0.7 GB for the picture reader alone (less if part of the download is already there). |
+| `Pictures need the picture reader ...` | `vision_model` in `etc\Rai.conf` points at a file that is not there and there is no `vision_url` to fetch it from. |
+| `No plot window is open` | Attach > Current plot needs an open R graphics window; draw a plot first. |
+| A picture answer takes long | Normal on a CPU (see 5, Pictures). Lower `image_max_tokens` (128) for speed, raise it for small text. |
 | `Could not reach the download server` | No internet, or a proxy Windows does not know about. Open the assistant again later: the download continues where it stopped. |
 | `The download was damaged (checksum mismatch)` | The partial file was deleted; open the assistant again to download it afresh. A persistent mismatch means `model_url` and `model_sha256` in `Rai.conf` do not belong together. |
 | `The model file was not found` | Check `model` in `etc\Rai.conf` against the actual filename in `ai\models\`. |

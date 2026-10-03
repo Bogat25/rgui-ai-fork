@@ -70,6 +70,7 @@
 #include <winhttp.h>
 #include <richedit.h>
 #include <bcrypt.h>
+#include <commdlg.h>
 
 #ifndef WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY
 #define WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY 4
@@ -81,6 +82,7 @@
 #include "rui.h"
 #include "aichat.h"
 #include "editor.h"
+#include "aiimage.h"
 #include "graphapp/stdimg.h"
 
 #define gettext GA_gettext
@@ -242,6 +244,12 @@ typedef struct {
     char model_url[1024];   /* where to fetch the model on first use */
     char model_sha256[72];  /* its published SHA-256, lower-case hex */
     long long model_bytes;  /* its size, for the disk check and progress */
+    int  vision;            /* load the picture reader with the model */
+    int  image_max_tokens;  /* tokens per picture; fewer read faster */
+    char vision_model[MAX_PATH];   /* the picture reader (mmproj) */
+    char vision_url[1024];
+    char vision_sha256[72];
+    long long vision_bytes;
 } aiconf;
 
 static aiconf CFG;
@@ -323,6 +331,16 @@ static void ai_defaults(void)
     snprintf(CFG.model_sha256, sizeof CFG.model_sha256, "%s",
 	     "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4");
     CFG.model_bytes = 2740937888LL;
+    /* Qwen3.5 reads pictures through this separate projector file. */
+    CFG.vision = 1;
+    CFG.image_max_tokens = 256;
+    ai_resolve("ai/models/Qwen3.5-4B-mmproj-F16.gguf", CFG.vision_model, MAX_PATH);
+    snprintf(CFG.vision_url, sizeof CFG.vision_url, "%s",
+	     "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/"
+	     "mmproj-F16.gguf");
+    snprintf(CFG.vision_sha256, sizeof CFG.vision_sha256, "%s",
+	     "cd88edcf8d031894960bb0c9c5b9b7e1fea6ebee02b9f7ce925a00d12891f864");
+    CFG.vision_bytes = 672423616LL;
     ai_resolve("ai/system_prompt.txt", CFG.system_prompt_file, MAX_PATH);
     ai_resolve("ai/context",           CFG.context_dir,        MAX_PATH);
 }
@@ -376,6 +394,15 @@ static void ai_load_config(void)
 	    snprintf(CFG.model_sha256, sizeof CFG.model_sha256, "%s", v);
 	else if (!strcasecmp(k, "model_bytes"))
 	    CFG.model_bytes = strtoll(v, NULL, 10);
+	else if (!strcasecmp(k, "vision"))         CFG.vision = ai_yes(v);
+	else if (!strcasecmp(k, "image_max_tokens")) CFG.image_max_tokens = atoi(v);
+	else if (!strcasecmp(k, "vision_model"))   ai_resolve(v, CFG.vision_model, MAX_PATH);
+	else if (!strcasecmp(k, "vision_url"))
+	    snprintf(CFG.vision_url, sizeof CFG.vision_url, "%s", v);
+	else if (!strcasecmp(k, "vision_sha256"))
+	    snprintf(CFG.vision_sha256, sizeof CFG.vision_sha256, "%s", v);
+	else if (!strcasecmp(k, "vision_bytes"))
+	    CFG.vision_bytes = strtoll(v, NULL, 10);
 	else if (!strcasecmp(k, "extra_args")) {
 	    strncpy(CFG.extra_args, v, sizeof(CFG.extra_args) - 1);
 	    CFG.extra_args[sizeof(CFG.extra_args) - 1] = '\0';
@@ -395,6 +422,7 @@ static void ai_load_config(void)
     if (CFG.startup_timeout < 10) CFG.startup_timeout = 10;
     if (CFG.request_timeout < 10) CFG.request_timeout = 10;
     if (CFG.context_max_chars < 0) CFG.context_max_chars = 0;
+    if (CFG.image_max_tokens < 0) CFG.image_max_tokens = 0;
 }
 
 int aichat_enabled(void)
@@ -432,7 +460,11 @@ static const char AI_FALLBACK_PROMPT[] =
     "in plain language.\n"
     "- When reference material is supplied below, follow its notation, "
     "method and conventions even where another approach would also work.\n"
-    "- If you are unsure, say so rather than inventing a function name.\n";
+    "- If you are unsure, say so rather than inventing a function name.\n"
+    "- When a picture is attached (a plot, a screenshot, a photo of an "
+    "exercise), first say briefly what you see in it that matters, then "
+    "answer. Read its text exactly; if part is unreadable, say so rather "
+    "than guess.\n";
 
 /* Read a whole file as UTF-8 text.  Returns malloc'd text, or NULL.
    A UTF-8 BOM is dropped; CRLF is normalised to LF. */
@@ -957,6 +989,22 @@ static int ai_file_exists(const char *path)
     return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+/* The picture reader is switched on and on disk. */
+static int ai_vision_ready(void)
+{
+    return CFG.vision && CFG.vision_model[0] && ai_file_exists(CFG.vision_model);
+}
+
+/* It is switched on, not on disk, and there is somewhere to fetch it. */
+static int ai_vision_missing(void)
+{
+    return CFG.vision && CFG.vision_model[0] && CFG.vision_url[0] &&
+	!ai_file_exists(CFG.vision_model);
+}
+
+/* Whether the running server was started with the picture reader. */
+static volatile LONG g_srv_vision = 0;
+
 /* Start llama-server as a child in a job object that kills it when RGui
    exits, so nothing is left holding the pendrive open.  Returns 1 if a
    process was started (or one was already running), 0 with a message in
@@ -1007,6 +1055,15 @@ static int ai_server_start_locked(char *err, size_t errlen)
 	snprintf(num, sizeof num, " -t %d", CFG.threads);       db_add(&cmd, num);
     }
     snprintf(num, sizeof num, " -ngl %d", CFG.gpu_layers);      db_add(&cmd, num);
+    /* The picture reader, when it is there; text works without it. */
+    int vision = ai_vision_ready();
+    if (vision) {
+	db_add(&cmd, " --mmproj \""); db_add(&cmd, CFG.vision_model); db_add(&cmd, "\"");
+	if (CFG.image_max_tokens > 0) {
+	    snprintf(num, sizeof num, " --image-max-tokens %d", CFG.image_max_tokens);
+	    db_add(&cmd, num);
+	}
+    }
     if (CFG.extra_args[0]) { db_add(&cmd, " "); db_add(&cmd, CFG.extra_args); }
 
     /* Run it from the server's own directory so that the DLLs shipped
@@ -1110,6 +1167,7 @@ static int ai_server_start_locked(char *err, size_t errlen)
     CloseHandle(pi.hThread);
     g_srv_proc = pi.hProcess;
     g_srv_pid  = pi.dwProcessId;
+    InterlockedExchange(&g_srv_vision, vision);
     return 1;
 }
 
@@ -1171,9 +1229,13 @@ static void ai_server_stop(void)
 {
     if (g_srv_proc) {
 	TerminateProcess(g_srv_proc, 0);
+	/* Gone before anyone asks the port again (a restart would find the
+	   dying server still answering /health). */
+	WaitForSingleObject(g_srv_proc, 5000);
 	CloseHandle(g_srv_proc);
 	g_srv_proc = NULL;
 	g_srv_pid  = 0;
+	InterlockedExchange(&g_srv_vision, 0);
     }
     if (g_job) { CloseHandle(g_job); g_job = NULL; }
 }
@@ -1182,7 +1244,8 @@ static void ai_server_stop(void)
 /* conversation store (main thread only)                               */
 /* ------------------------------------------------------------------ */
 
-typedef struct { char *role; char *content; } aimsg;
+/* imgs: the pictures that went with a question (data URLs). */
+typedef struct { char *role; char *content; char **imgs; int nimg; } aimsg;
 
 static aimsg *g_conv  = NULL;
 static int    g_nconv = 0, g_cconv = 0;
@@ -1197,7 +1260,24 @@ static void conv_add(const char *role, const char *content)
     }
     g_conv[g_nconv].role    = xstrdup(role);
     g_conv[g_nconv].content = xstrdup(content);
+    g_conv[g_nconv].imgs    = NULL;
+    g_conv[g_nconv].nimg    = 0;
     if (g_conv[g_nconv].role && g_conv[g_nconv].content) g_nconv++;
+}
+
+/* As conv_add, and the message takes over imgs (an array of n malloc'd
+   data URLs, itself malloc'd). */
+static void conv_add_imgs(const char *role, const char *content, char **imgs, int n)
+{
+    int before = g_nconv;
+    conv_add(role, content);
+    if (g_nconv > before) {
+	g_conv[before].imgs = imgs;
+	g_conv[before].nimg = n;
+    } else {
+	for (int i = 0; i < n; i++) free(imgs[i]);
+	free(imgs);
+    }
 }
 
 static void conv_clear(void)
@@ -1205,12 +1285,48 @@ static void conv_clear(void)
     for (int i = 0; i < g_nconv; i++) {
 	free(g_conv[i].role);
 	free(g_conv[i].content);
+	for (int k = 0; k < g_conv[i].nimg; k++) free(g_conv[i].imgs[k]);
+	free(g_conv[i].imgs);
     }
     g_nconv = 0;
 }
 
-/* Build the whole /v1/chat/completions body.  Runs on the main thread;
-   the worker only ever sees the finished string. */
+/* Pictures waiting to go with the next question: data URLs, and a name
+   for each to show.  At most AI_MAX_IMAGES go in one request, history
+   included; each costs image_max_tokens of the context. */
+#define AI_MAX_IMAGES 4
+static char *g_pimg[AI_MAX_IMAGES];
+static char  g_pimg_label[AI_MAX_IMAGES][200];
+static int   g_npimg = 0;
+
+/* One message's "content": a string, or -- with pictures -- the list of
+   parts of the OpenAI format, pictures first.  Pictures that no longer
+   fit are replaced by a note, so the model knows there was one. */
+static void ai_put_content(dynbuf *b, const char *text, char *const *imgs,
+			   int nimg, int show)
+{
+    if (nimg && show) {
+	db_add(b, "\"content\":[");
+	for (int i = 0; i < nimg; i++) {
+	    db_add(b, "{\"type\":\"image_url\",\"image_url\":{\"url\":\"");
+	    json_escape(b, imgs[i]);
+	    db_add(b, "\"}},");
+	}
+	db_add(b, "{\"type\":\"text\",\"text\":\"");
+	json_escape(b, text);
+	db_add(b, "\"}]");
+    } else {
+	db_add(b, "\"content\":\"");
+	json_escape(b, text);
+	if (nimg)
+	    json_escape(b, "\n[A picture was attached here; it is no longer shown.]");
+	db_add(b, "\"");
+    }
+}
+
+/* Build the whole /v1/chat/completions body, with the pictures waiting
+   in g_pimg going with the question.  Runs on the main thread; the
+   worker only ever sees the finished string. */
 static char *ai_build_request(const char *question)
 {
     char *sys = ai_build_system_prompt(question);
@@ -1224,16 +1340,27 @@ static char *ai_build_request(const char *question)
 
     int first = g_nconv - CFG.keep_history;
     if (first < 0) first = 0;
+    /* Earlier pictures stay for follow-up questions, newest first, while
+       they fit; the server reuses what it has already read of them. */
+    int budget = ai_vision_ready() ? AI_MAX_IMAGES - g_npimg : 0;
+    unsigned char *show = (unsigned char *) calloc((size_t) g_nconv + 1, 1);
+    for (int i = g_nconv - 1; show && i >= first; i--)
+	if (g_conv[i].nimg && g_conv[i].nimg <= budget) {
+	    show[i] = 1;
+	    budget -= g_conv[i].nimg;
+	}
     for (int i = first; i < g_nconv; i++) {
 	db_add(&b, ",{\"role\":\"");
 	json_escape(&b, g_conv[i].role);
-	db_add(&b, "\",\"content\":\"");
-	json_escape(&b, g_conv[i].content);
-	db_add(&b, "\"}");
+	db_add(&b, "\",");
+	ai_put_content(&b, g_conv[i].content, g_conv[i].imgs, g_conv[i].nimg,
+		       show ? show[i] : 0);
+	db_add(&b, "}");
     }
-    db_add(&b, ",{\"role\":\"user\",\"content\":\"");
-    json_escape(&b, question);
-    db_add(&b, "\"}]");
+    free(show);
+    db_add(&b, ",{\"role\":\"user\",");
+    ai_put_content(&b, question, g_pimg, g_npimg, 1);
+    db_add(&b, "}]");
 
     snprintf(num, sizeof num, ",\"temperature\":%.3f", CFG.temperature);
     db_add(&b, num);
@@ -1265,6 +1392,7 @@ static dynbuf g_pending;                /* guarded by g_cs */
 static volatile LONG g_post_pending = 0;
 static volatile LONG g_busy = 0;
 static HANDLE g_worker = NULL;
+static volatile LONG g_req_images = 0;   /* pictures in the request in flight */
 
 static void w_emit(const char *s, size_t n)
 {
@@ -1385,7 +1513,10 @@ static unsigned __stdcall ai_worker(void *arg)
 
     httpstream hs;
     hs_init(&hs, s);
-    w_status("Thinking...");
+    /* Reading a picture is the slow part on a CPU, and nothing arrives
+       until it is done: say so. */
+    w_status(g_req_images ? "Reading the picture; on this computer that takes "
+	     "a little while..." : "Thinking...");
     int status = hs_request(&hs, "POST", "/v1/chat/completions",
 			    request, strlen(request));
 
@@ -1423,6 +1554,7 @@ static unsigned __stdcall ai_worker(void *arg)
 			char *piece = json_find_string(payload, "content");
 			if (piece) {
 			    if (*piece) {
+				if (!sawdata && g_req_images) w_status("Answering...");
 				sawdata = 1;
 				db_add(&raw, piece);
 				w_emit_filtered(&raw, &emitted, &in_think);
@@ -1478,6 +1610,10 @@ finish:
    real name once its SHA-256 matches the published one. */
 
 static volatile LONG g_downloading = 0;
+
+/* Progress over all the files of one download (the model and the picture
+   reader), when their sizes are known.  Download worker only. */
+static long long g_dl_done = 0, g_dl_all = 0;
 
 static long long ai_file_size_w(const wchar_t *path)
 {
@@ -1685,13 +1821,15 @@ static int ai_download_file(const char *url, const char *dest,
 	    have += got;
 	    if (GetTickCount() - last >= 1000) {
 		last = GetTickCount();
-		if (total > 0)
+		long long sh = g_dl_all > 0 ? g_dl_done + have : have;
+		long long st = g_dl_all > 0 ? g_dl_all : total;
+		if (st > 0)
 		    w_status("Downloading the AI model: %.2f of %.2f GB (%d%%). "
-			     "R stays usable; Stop pauses.", have / GB, total / GB,
-			     (int) (100.0 * (double) have / (double) total));
+			     "R stays usable; Stop pauses.", sh / GB, st / GB,
+			     (int) (100.0 * (double) sh / (double) st));
 		else
 		    w_status("Downloading the AI model: %.2f GB. Stop pauses.",
-			     have / GB);
+			     sh / GB);
 	    }
 	}
 	CloseHandle(out);
@@ -1738,13 +1876,28 @@ done:
     return ok;
 }
 
+/* The model, then the picture reader: whichever of them is missing. */
 static unsigned __stdcall ai_download_worker(void *unused)
 {
     char err[512];
-    int ok = ai_download_file(CFG.model_url, CFG.model, CFG.model_sha256,
+    int ok = 1;
+    int need_model  = CFG.model[0] && CFG.model_url[0] && !ai_file_exists(CFG.model);
+    int need_vision = ai_vision_missing();
+    g_dl_done = g_dl_all = 0;
+    if ((!need_model || CFG.model_bytes > 0) && (!need_vision || CFG.vision_bytes > 0))
+	g_dl_all = (need_model ? CFG.model_bytes : 0) + (need_vision ? CFG.vision_bytes : 0);
+    if (need_model) {
+	ok = ai_download_file(CFG.model_url, CFG.model, CFG.model_sha256,
 			      CFG.model_bytes, err, sizeof err);
+	g_dl_done += CFG.model_bytes;
+    }
+    if (ok && need_vision)
+	ok = ai_download_file(CFG.vision_url, CFG.vision_model, CFG.vision_sha256,
+			      CFG.vision_bytes, err, sizeof err);
+    g_dl_done = g_dl_all = 0;
     if (ok)
-	w_status("The AI model is downloaded.");
+	w_status(need_model ? "The AI model is downloaded."
+		 : "The picture reader is downloaded.");
     else
 	w_status("%s", err);
     PostMessage(g_msgwin, WM_AI_DLDONE, (WPARAM) ok, 0);
@@ -1766,7 +1919,9 @@ static int     g_reply_open = 0;
 static const char AI_WELCOME[] =
     "Local R assistant.\r\n"
     "Type a question below and press Send (or Ctrl+Enter). The Attach "
-    "menu adds your last error, your script or recent console output.\r\n"
+    "menu adds your last error, your script or recent console output, "
+    "and pictures: your current plot, a picture file, or a screenshot "
+    "pasted with Ctrl+V.\r\n"
     "Copy code puts the code from the last answer on the clipboard; "
     "To editor puts it into your open script, or a new one. Nothing is "
     "run for you.\r\n"
@@ -2139,9 +2294,15 @@ static void in_refont_all(HWND h)
 
 /* Paste as plain text: a question box has no use for the fonts and
    colours of a web page or a Word document. */
+static void ai_paste_picture(void);
+
 static void in_paste(HWND h)
 {
-    if (!IsClipboardFormatAvailable(CF_UNICODETEXT)) return;
+    if (!IsClipboardFormatAvailable(CF_UNICODETEXT)) {
+	/* A screenshot or a copied picture file: attach it. */
+	if (aiimg_clipboard_has_picture()) ai_paste_picture();
+	return;
+    }
     CHARRANGE a, b;
     SendMessage(h, EM_EXGETSEL, 0, (LPARAM) &a);
     SendMessage(h, EM_PASTESPECIAL, CF_UNICODETEXT, 0);
@@ -2483,7 +2644,15 @@ static LRESULT CALLBACK ai_msgproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 	InterlockedExchange(&g_cancel, 0);
 	InterlockedExchange(&g_busy, 0);
 	ai_set_busy(0);
-	if (wp && CFG.autostart) ai_start_warmup();
+	if (wp) {
+	    /* A server already running without the picture reader that just
+	       arrived is restarted with it. */
+	    ai_srv_lock();
+	    int restart = g_srv_proc && !g_srv_vision && ai_vision_ready();
+	    if (restart) ai_server_stop();
+	    ai_srv_unlock();
+	    if (CFG.autostart || restart) ai_start_warmup();
+	}
 	return 0;
     }
     return DefWindowProc(hwnd, msg, wp, lp);
@@ -2518,41 +2687,79 @@ static int ai_model_missing(void)
     return CFG.model[0] && !ai_file_exists(CFG.model);
 }
 
-/* If the model is missing and there is somewhere to fetch it from, ask
-   whether to download it now and start the download if so.  Returns 1
-   when the model is missing (asked or not), 0 when there is nothing to
-   do here. */
-static int ai_offer_download(void)
+/* Bytes still to fetch of a file: all of it, less a .part already there. */
+static long long ai_left_to_fetch(const char *path, long long bytes)
 {
-    if (!ai_model_missing() || !CFG.model_url[0]) return 0;
+    char part[MAX_PATH + 8];
+    snprintf(part, sizeof part, "%s.part", path);
+    wchar_t *w = u8_to_wcs(part);
+    long long have = w ? ai_file_size_w(w) : -1;
+    free(w);
+    if (have < 0 || have > bytes) have = 0;
+    return bytes - have;
+}
+
+static int g_vision_declined = 0;     /* asked once this session; said no */
+
+/* Offer to download what is missing: the model (the picture reader comes
+   with it), or, the model being there, the picture reader alone.
+   want_vision: pictures are about to be sent.  Returns 1 when the caller
+   must not go on -- no model, a download running or just started, or
+   pictures without a reader -- and 0 when it can. */
+static int ai_offer_download(int want_vision)
+{
+    int need_model  = ai_model_missing() && CFG.model_url[0];
+    int need_vision = ai_vision_missing();
+    if (want_vision && !need_vision && !ai_vision_ready()) {
+	ai_set_status(CFG.vision
+		      ? "Pictures need the picture reader (vision_model in etc\\Rai.conf), "
+			"and it is not on this computer."
+		      : "Reading pictures is switched off (vision = no in etc\\Rai.conf).");
+	return 1;
+    }
+    if (!need_model && !need_vision) return 0;
+    int blocks = need_model || want_vision;
     if (g_downloading) {
 	ai_set_status("The AI model is still downloading. Stop pauses it.");
 	return 1;
     }
-    if (g_busy) return 1;
+    if (g_busy) return blocks;
+    if (!need_model && !want_vision && g_vision_declined) return 0;
 
-    char part[MAX_PATH + 8], q[800];
-    snprintf(part, sizeof part, "%s.part", CFG.model);
-    wchar_t *wpart = u8_to_wcs(part);
-    long long have = wpart ? ai_file_size_w(wpart) : -1;
-    free(wpart);
-    if (have > 0 && CFG.model_bytes > 0)
+    char q[900];
+    long long vleft = need_vision ? ai_left_to_fetch(CFG.vision_model, CFG.vision_bytes) : 0;
+    if (need_model) {
+	long long mleft = ai_left_to_fetch(CFG.model, CFG.model_bytes);
+	long long all = CFG.model_bytes + (need_vision ? CFG.vision_bytes : 0);
+	long long left = mleft + vleft;
+	if (CFG.model_bytes <= 0)
+	    snprintf(q, sizeof q,
+		     "The AI model is not on this computer yet.\n\nDownload it now?");
+	else if (left < all)
+	    snprintf(q, sizeof q,
+		     "Part of the AI model is already downloaded (%.1f of %.1f GB).\n\n"
+		     "Continue the download now?", (all - left) / 1e9, all / 1e9);
+	else
+	    snprintf(q, sizeof q,
+		     "The AI model is not on this computer yet.\n\n"
+		     "Download it now? It is %.1f GB and is needed only once. "
+		     "The download runs in the background, R stays usable, and an "
+		     "interrupted download continues where it stopped.", all / 1e9);
+    } else
 	snprintf(q, sizeof q,
-		 "Part of the AI model is already downloaded (%.1f of %.1f GB).\n\n"
-		 "Continue the download now?", have / 1e9, CFG.model_bytes / 1e9);
-    else if (CFG.model_bytes > 0)
-	snprintf(q, sizeof q,
-		 "The AI model is not on this computer yet.\n\n"
-		 "Download it now? It is %.1f GB and is needed only once. "
-		 "The download runs in the background, R stays usable, and an "
-		 "interrupted download continues where it stopped.",
-		 CFG.model_bytes / 1e9);
-    else
-	snprintf(q, sizeof q,
-		 "The AI model is not on this computer yet.\n\nDownload it now?");
+		 "The assistant can now read pictures: plots, screenshots of errors, "
+		 "photos of exercises. That needs one more download of %.1f GB, "
+		 "once.\n\nDownload it now? It runs in the background and R stays "
+		 "usable; the assistant answers again when it is done.", vleft / 1e9);
     if (askyesno(q) != YES) {
-	ai_set_status("The AI model is not downloaded. Send a question to be asked again.");
-	return 1;
+	if (need_model)
+	    ai_set_status("The AI model is not downloaded. Send a question to be asked again.");
+	else {
+	    g_vision_declined = 1;
+	    ai_set_status("Without the picture reader the assistant reads text only. "
+			  "Attach a picture to be asked again.");
+	}
+	return blocks;
     }
 
     if (InterlockedCompareExchange(&g_busy, 1, 0) != 0) return 1;
@@ -2574,17 +2781,223 @@ static int ai_offer_download(void)
     return 1;
 }
 
+/* --- pictures ------------------------------------------------------- */
+
+/* Longer side of a picture as sent.  The server shrinks it further to
+   image_max_tokens; this only keeps the request small. */
+#define AI_IMAGE_SIDE 1600
+
+static const char AI_PICTURE_QUESTION[] =
+    "What does this picture show? If it is a plot, R output or an error, "
+    "explain it.";
+
+static control g_attlbl = NULL;       /* the "Attached: ..." line */
+static void ai_layout(window w, rect r);
+
+static void ai_images_changed(void)
+{
+    if (!g_attlbl) return;
+    if (g_npimg) {
+	dynbuf t;
+	db_init(&t);
+	db_add(&t, g_npimg == 1 ? "Attached picture: " : "Attached pictures: ");
+	for (int i = 0; i < g_npimg; i++) {
+	    if (i) db_add(&t, ", ");
+	    db_add(&t, g_pimg_label[i]);
+	}
+	db_add(&t, ". It goes with your next question (Attach > Remove pictures drops it).");
+	settext(g_attlbl, t.s);
+	db_free(&t);
+	show(g_attlbl);
+    } else {
+	settext(g_attlbl, "");
+	hide(g_attlbl);
+    }
+    if (g_panel) ai_layout(g_panel, getrect(g_panel));
+}
+
+static void ai_drop_pictures(void)
+{
+    for (int i = 0; i < g_npimg; i++) { free(g_pimg[i]); g_pimg[i] = NULL; }
+    g_npimg = 0;
+    ai_images_changed();
+}
+
+/* Take a picture (url is consumed) for the next question. */
+static void ai_add_picture(char *url, const char *label, int w, int h)
+{
+    if (!url) return;
+    if (g_npimg >= AI_MAX_IMAGES) {
+	free(url);
+	char msg[120];
+	snprintf(msg, sizeof msg, "At most %d pictures go with one question.", AI_MAX_IMAGES);
+	ai_set_status(msg);
+	return;
+    }
+    g_pimg[g_npimg] = url;
+    snprintf(g_pimg_label[g_npimg], sizeof g_pimg_label[0], "%s (%d x %d)", label, w, h);
+    g_npimg++;
+    ai_images_changed();
+    ai_set_status("Picture attached. Type your question, or just press Send.");
+    if (!ai_vision_ready()) ai_offer_download(1);
+}
+
+static int ai_is_picture_name(const wchar_t *path)
+{
+    static const wchar_t *const EXT[] =
+	{ L".png", L".jpg", L".jpeg", L".bmp", L".gif", L".tif", L".tiff", NULL };
+    const wchar_t *dot = wcsrchr(path, L'.');
+    if (!dot) return 0;
+    for (int i = 0; EXT[i]; i++) if (!_wcsicmp(dot, EXT[i])) return 1;
+    return 0;
+}
+
+static void ai_attach_picture_file(const wchar_t *path)
+{
+    int w = 0, h = 0;
+    const wchar_t *base = wcsrchr(path, L'\\');
+    char *name = wcs_to_u8(base ? base + 1 : path);
+    char *url = aiimg_from_file(path, AI_IMAGE_SIDE, &w, &h);
+    if (url)
+	ai_add_picture(url, name ? name : "picture", w, h);
+    else {
+	char msg[400];
+	snprintf(msg, sizeof msg, "\"%s\" could not be read as a picture.", name ? name : "?");
+	ai_set_status(msg);
+    }
+    free(name);
+}
+
+static void ai_do_attach_file(control m)
+{
+    wchar_t buf[8192];
+    buf[0] = L'\0';
+    OPENFILENAMEW of;
+    memset(&of, 0, sizeof of);
+    of.lStructSize = sizeof of;
+    of.hwndOwner = g_panel ? (HWND) getHandle(g_panel) : NULL;
+    of.lpstrFilter = L"Pictures (PNG, JPEG, BMP, GIF, TIFF)\0"
+		     L"*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tif;*.tiff\0All files\0*.*\0";
+    of.lpstrFile = buf;
+    of.nMaxFile = sizeof buf / sizeof buf[0];
+    of.lpstrTitle = L"Attach a picture";
+    /* NOCHANGEDIR: R's working directory is not the dialog's business. */
+    of.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER |
+	       OFN_ALLOWMULTISELECT | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
+    if (!GetOpenFileNameW(&of)) return;
+    /* One file: its full path.  Several: the folder, then the names. */
+    const wchar_t *next = buf + wcslen(buf) + 1;
+    if (!*next) { ai_attach_picture_file(buf); return; }
+    for (const wchar_t *f = next; *f; f += wcslen(f) + 1) {
+	wchar_t path[MAX_PATH * 2];
+	_snwprintf(path, sizeof path / sizeof path[0], L"%ls\\%ls", buf, f);
+	path[sizeof path / sizeof path[0] - 1] = L'\0';
+	ai_attach_picture_file(path);
+    }
+}
+
+/* RGui's graphics windows are titled "R Graphics: Device 2 (ACTIVE)". */
+typedef struct { HWND best; int active; } plotfind;
+
+static BOOL CALLBACK ai_plot_cb(HWND h, LPARAM lp)
+{
+    plotfind *pf = (plotfind *) lp;
+    wchar_t t[160];
+    if (!IsWindowVisible(h) || !GetWindowTextW(h, t, 160)) return TRUE;
+    if (wcsncmp(t, L"R Graphics", 10)) return TRUE;
+    int act = wcsstr(t, L"(ACTIVE)") != NULL;
+    if (!pf->best || (act && !pf->active)) { pf->best = h; pf->active = act; }
+    return TRUE;
+}
+
+static BOOL CALLBACK ai_plot_top_cb(HWND h, LPARAM lp)
+{
+    ai_plot_cb(h, lp);
+    EnumChildWindows(h, ai_plot_cb, lp);
+    return TRUE;
+}
+
+static void ai_do_attach_plot(control m)
+{
+    plotfind pf = { NULL, 0 };
+    EnumThreadWindows(GetCurrentThreadId(), ai_plot_top_cb, (LPARAM) &pf);
+    if (!pf.best) {
+	ai_set_status("No plot window is open. Draw a plot first, for example plot(1:10).");
+	return;
+    }
+    if (IsIconic(pf.best)) {
+	ai_set_status("The plot window is minimised: restore it and attach it again.");
+	return;
+    }
+    int devnum = 0;
+    wchar_t t[160];
+    const wchar_t *d;
+    if (GetWindowTextW(pf.best, t, 160) && (d = wcsstr(t, L"Device ")))
+	devnum = _wtoi(d + 7);
+    /* The plot as R drew it, from the device's own bitmap (aiplot.c).
+       A capture of the screen is only the fallback: inside RGui's frame
+       it gets whatever covers the plot window, this panel included. */
+    int w = 0, h = 0, pw = 0, ph = 0, stride = 0;
+    char *url = NULL;
+    unsigned char *px = aiplot_pixels(pf.best, devnum, &pw, &ph, &stride);
+    if (px) {
+	url = aiimg_from_pixels(px, pw, ph, stride, AI_IMAGE_SIDE, &w, &h);
+	free(px);
+    }
+    if (!url) url = aiimg_from_window(pf.best, AI_IMAGE_SIDE, &w, &h);
+    if (!url) { ai_set_status("The plot window could not be captured."); return; }
+    char label[64] = "plot";
+    if (devnum > 0) snprintf(label, sizeof label, "plot, device %d", devnum);
+    ai_add_picture(url, label, w, h);
+}
+
+/* A picture on the clipboard, or picture files copied in Explorer. */
+static void ai_paste_picture(void)
+{
+    wchar_t *files = aiimg_clipboard_files();
+    if (files) {
+	int n = 0;
+	for (const wchar_t *f = files; *f; f += wcslen(f) + 1)
+	    if (ai_is_picture_name(f)) { ai_attach_picture_file(f); n++; }
+	free(files);
+	if (!n) ai_set_status("The copied files are not pictures (PNG, JPEG, BMP, GIF, TIFF).");
+	return;
+    }
+    int w = 0, h = 0;
+    char *url = aiimg_from_clipboard(AI_IMAGE_SIDE, &w, &h);
+    if (!url) {
+	ai_set_status("There is no picture on the clipboard. A screenshot "
+		      "(Windows+Shift+S) or Copy image in a browser puts one there.");
+	return;
+    }
+    ai_add_picture(url, "picture from the clipboard", w, h);
+}
+
+static void ai_do_attach_clip(control m) { ai_paste_picture(); }
+
+static void ai_do_attach_remove(control m)
+{
+    if (!g_npimg) { ai_set_status("No picture is attached."); return; }
+    ai_drop_pictures();
+    ai_set_status("Pictures removed.");
+}
+
 static void ai_do_send(control c)
 {
     if (!g_hinput) return;
-    /* No model yet: offer the download; the question stays in the box. */
-    if (ai_offer_download()) return;
+    /* No model yet (or pictures and no picture reader): offer the
+       download; the question and the pictures stay. */
+    if (ai_offer_download(g_npimg > 0)) return;
     if (InterlockedCompareExchange(&g_busy, 1, 0) != 0) {
 	ai_set_status("Still answering the previous question.");
 	return;
     }
     char *q = edit_get_u8(g_hinput);
     if (q) { ai_trim(q); }
+    if ((!q || !*q) && g_npimg) {        /* a picture and no words */
+	free(q);
+	q = xstrdup(AI_PICTURE_QUESTION);
+    }
     if (!q || !*q) {
 	free(q);
 	InterlockedExchange(&g_busy, 0);
@@ -2598,17 +3011,33 @@ static void ai_do_send(control c)
 	ai_set_status("Out of memory building the request.");
 	return;
     }
-    conv_add("user", q);
-
     if (g_hhist) {
 	tr_begin(g_hhist);
 	tr_add(g_hhist, "You\n", TF_YOU);
+	for (int i = 0; i < g_npimg; i++) {
+	    tr_add(g_hhist, "Picture: ", TF_NOTE);
+	    tr_add(g_hhist, g_pimg_label[i], TF_NOTE);
+	    tr_add(g_hhist, "\n", TF_NOTE);
+	}
 	tr_add(g_hhist, q, TF_TEXT);
 	tr_add(g_hhist, "\n\n", TF_TEXT);
 	tr_add(g_hhist, "R assistant\n", TF_BOT);
 	tr_end(g_hhist);
 	md_begin(g_hhist);
     }
+    /* The pictures move into the conversation, for follow-up questions. */
+    int nimg = g_npimg;
+    char **imgs = nimg ? (char **) malloc((size_t) nimg * sizeof(char *)) : NULL;
+    if (imgs) {
+	for (int i = 0; i < nimg; i++) { imgs[i] = g_pimg[i]; g_pimg[i] = NULL; }
+	g_npimg = 0;
+	conv_add_imgs("user", q, imgs, nimg);
+    } else {
+	conv_add("user", q);
+	ai_drop_pictures();
+    }
+    ai_images_changed();
+    InterlockedExchange(&g_req_images, imgs ? nimg : 0);
     free(q);
     edit_clear(g_hinput);
 
@@ -2880,6 +3309,7 @@ static void ai_do_clear(control c)
 {
     if (g_busy) { ai_set_status("Stop the answer first."); return; }
     conv_clear();
+    ai_drop_pictures();
     db_free(&g_reply);
     g_reply_open = 0;
     edit_clear(g_hhist);
@@ -2908,10 +3338,13 @@ static void ai_layout(window w, rect r)
 
     int bottom = r.height - AI_PAD - AI_BTN_H;
     int inputy = bottom - 4 - AI_INPUT_H;
-    int histh  = inputy - 4 - y;
+    /* The "Attached picture" line, above the question box, when there is one. */
+    int attach = (g_attlbl && g_npimg) ? AI_STATUS_H + 2 : 0;
+    int histh  = inputy - 4 - attach - y;
     if (histh < 60) histh = 60;
 
     if (g_hist)  resize(g_hist,  rect(x, y, ww, histh));
+    if (attach)  resize(g_attlbl, rect(x, inputy - attach, ww, AI_STATUS_H));
     if (g_input) resize(g_input, rect(x, inputy, ww, AI_INPUT_H));
 
     int bx = x;
@@ -3049,6 +3482,7 @@ static int ai_create(void)
     gsetcursor(g_panel, ArrowCursor);
 
     g_status = newlabel("Ready.", rect(0, 0, 10, AI_STATUS_H), AlignLeft);
+    g_attlbl = newlabel("", rect(0, 0, 10, AI_STATUS_H), AlignLeft);
     g_hist   = newrichtextarea("", rect(0, 0, 10, 10));
     g_input  = newrichtextarea("", rect(0, 0, 10, 10));
     g_bsend    = newbutton("Send",       rect(0, 0, AI_BTN_W, AI_BTN_H), ai_do_send);
@@ -3057,7 +3491,7 @@ static int ai_create(void)
     g_beditor  = newbutton("To editor",  rect(0, 0, AI_BTN_W, AI_BTN_H), ai_do_editor);
     g_bclear   = newbutton("New chat",   rect(0, 0, AI_BTN_W, AI_BTN_H), ai_do_clear);
 
-    if (!g_status || !g_hist || !g_input || !g_bsend || !g_bstop ||
+    if (!g_status || !g_attlbl || !g_hist || !g_input || !g_bsend || !g_bstop ||
 	!g_bcopy || !g_beditor || !g_bclear) {
 	del(g_panel);
 	g_panel = NULL;
@@ -3142,6 +3576,11 @@ static int ai_create(void)
     newmenuitem(G_("Last error from the console"), 0, ai_do_attach_error);
     newmenuitem(G_("Current script"), 0, ai_do_attach_script);
     newmenuitem(G_("Recent console output"), 0, ai_do_attach_console);
+    newmenuitem("-", 0, NULL);
+    newmenuitem(G_("Current plot"), 0, ai_do_attach_plot);
+    newmenuitem(G_("Picture file..."), 0, ai_do_attach_file);
+    newmenuitem(G_("Picture from the clipboard"), 0, ai_do_attach_clip);
+    newmenuitem(G_("Remove pictures"), 0, ai_do_attach_remove);
     newmenu(G_("Misc"));
     newmenuitem(G_("Stop the answer or the download"), 0, ai_do_stop);
     newmenuitem("-", 0, NULL);
@@ -3162,6 +3601,7 @@ static int ai_create(void)
        restores the conversation. */
     setclose(g_panel, ai_hide_panel);
 
+    hide(g_attlbl);
     ai_layout(g_panel, getrect(g_panel));
     tr_block(g_hhist, AI_WELCOME, TF_NOTE);
     ai_set_busy(0);
@@ -3212,7 +3652,7 @@ void aichat_toggle(void)
 	}
 	show(g_panel);
 	if (g_input) { addto(g_panel); show(g_input); }
-	if (!ai_offer_download() && CFG.autostart)
+	if (!ai_offer_download(0) && CFG.autostart && !g_downloading)
 	    ai_start_warmup();
 	return;
     }
@@ -3235,5 +3675,6 @@ void aichat_shutdown(void)
 	g_worker = NULL;
     }
     ai_server_stop();
+    aiimg_shutdown();
     if (g_wsa_up) { WSACleanup(); g_wsa_up = 0; }
 }

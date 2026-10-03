@@ -689,6 +689,15 @@
  aichat_hotkey
  aichat_shutdown
  aichat_toggle
+ aiimg_clipboard_files
+ aiimg_clipboard_has_picture
+ aiimg_from_clipboard
+ aiimg_from_file
+ aiimg_from_hbitmap
+ aiimg_from_pixels
+ aiimg_from_window
+ aiimg_shutdown
+ aiplot_pixels
  editor_insert_top
  editor_top_text
  applyGUI
