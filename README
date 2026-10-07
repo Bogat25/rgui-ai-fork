@@ -1,3 +1,14 @@
+RGui AI - independent hard fork
+================================
+
+Local AI for R, statistics, plots, and reference notes is this fork's main
+goal. Long-term synchronization with upstream R is not planned.
+Open Misc > AI assistant (Ctrl+T). Model setup downloads about 3.4 GB;
+inference then runs locally through the bundled CPU runtime.
+
+In the source checkout, README.md and docs/README.md contain the current
+fork documentation. The original upstream R README follows below.
+
 
 			THE BASIC R README
 

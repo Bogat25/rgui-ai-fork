@@ -36,3 +36,21 @@ src/include/libintl.h
 
 # ---- test harness output ----
 src/gnuwin32/aitests/expected.txt
+
+# Private runtime state and credentials (tracked source fixtures are retained).
+/work/
+/.ai-context/
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+.Renviron
+.Rhistory
+.RData
+*.gguf.part
+*.log
+*.pfx
+*.p12
+*.dmp
+__pycache__/

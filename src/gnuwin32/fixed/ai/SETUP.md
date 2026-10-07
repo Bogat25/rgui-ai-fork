@@ -1,5 +1,10 @@
 # Setting up the RGui AI assistant on a pendrive
 
+This is the detailed Windows setup guide for the independent RGui AI hard fork.
+Start at the [repository README](../../../../README.md) or
+[documentation index](../../../../docs/README.md) for current public guidance.
+Build paths and drive letters below are examples.
+
 Written for the person assembling the stick. Do this once, on a machine
 where you can download files and run a build; afterwards the stick works
 offline on any Windows 10/11 x64 machine that lets you run a program
@@ -214,7 +219,8 @@ No indexing step, no restart: edit a file, ask the next question.
 6. Ask something, in any language: accents, Greek, maths symbols,
    Chinese and emoji all type, paste and display. Answers appear
    formatted as they arrive: code in grey boxes, `inline code`, bold,
-   bullets. Pasting into the question box always pastes plain text.
+   bullets. Text pastes without rich formatting; pasted screenshots become
+   picture attachments.
    **Attach** (in the panel's menu bar) adds your last
    console error, your current script or recent console output to the
    question, where you can edit it before sending. It also takes
@@ -235,8 +241,8 @@ No indexing step, no restart: edit a file, ask the next question.
 
 ## 8. If something goes wrong
 
-The assistant is a separate process, so none of this can take RGui with
-it. The console, the editor, graphics and packages keep working.
+The model server runs in a separate process. The console, editor, graphics,
+and packages remain available during model operations.
 
 | Status line says | Do this |
 |---|---|
@@ -260,8 +266,9 @@ does not appear and no assistant code runs.
 ## 9. What it does not do
 
 - It does not run code for you. Ever. You copy it and run it yourself.
-- It does not reach the network. It talks to `127.0.0.1` only, and the
-  model is a file on the stick.
+- Inference talks to the local loopback server, using model files on disk.
+  Initial/resumed downloads contact the configured model hosts; R and user
+  packages have their own network behavior.
 - It does not learn. The course material is re-read from disk on every
   question; there is no training and no memory between sessions beyond
   the conversation in the open panel.
