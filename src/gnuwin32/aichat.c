@@ -232,7 +232,7 @@ typedef struct {
     int  startup_timeout;   /* seconds to wait for the model to load */
     int  request_timeout;   /* seconds of silence before giving up */
     int  font_points;
-    int  hotkey;            /* accelerator letter, 0 for none */
+    int  hotkey;            /* shortcut letter, 0 for none */
     double temperature;
     double top_p;
     char host[64];
@@ -3583,9 +3583,9 @@ static void ai_resize(window w, rect r)
 /* The transcript is msftedit's RichEdit (RICHEDIT50W), not GraphApp's
    RichEdit20W: only the newer one shows pictures given as RTF.  GraphApp
    has no constructor for it, so it is a plain child window of the panel,
-   placed by ai_layout.  GraphApp's menu shortcuts only work while one of
-   its own controls has the focus, so ai_box_proc handles the panel's two
-   that matter there (Ctrl+T, Ctrl+V); copy and select all are RichEdit's. */
+   placed by ai_layout. The application key filter handles the assistant
+   shortcut before dispatch. ai_box_proc routes Ctrl+V to the question box;
+   copy and select all are RichEdit's. */
 #define AI_TRANSCRIPT_CLASS L"RICHEDIT50W"
 
 static HWND ai_new_transcript(HWND parent)
@@ -3651,10 +3651,8 @@ static LRESULT CALLBACK ai_box_proc(HWND h, UINT m, WPARAM w, LPARAM l)
 	LRESULT r = 0;
 	int ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
 	int alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
-	if (h == g_hhist && m == WM_KEYDOWN && ctrl && !alt &&
-	    (w == (WPARAM) aichat_hotkey() || w == 'V')) {
-	    if (w == 'V') ai_do_edit_paste(NULL);     /* into the question box */
-	    else aichat_toggle();
+	if (h == g_hhist && m == WM_KEYDOWN && ctrl && !alt && w == 'V') {
+	    ai_do_edit_paste(NULL);     /* into the question box */
 	} else if (h == g_hinput && m == WM_KEYDOWN &&
 	    ((w == VK_INSERT && !ctrl && (GetKeyState(VK_SHIFT) & 0x8000)) ||
 	     (w == 'V' && ctrl && !(GetKeyState(VK_MENU) & 0x8000))))
@@ -3716,10 +3714,6 @@ static void ai_hide_panel(control c)
 {
     if (g_panel) hide(g_panel);
 }
-
-static void ai_menu_close(control m) { ai_hide_panel(NULL); }
-
-static void ai_menu_toggle(control m) { aichat_toggle(); }
 
 
 static int ai_create(void)
@@ -3795,9 +3789,8 @@ static int ai_create(void)
     }
 
     /* The same shape of menu bar and toolbar as the console, so RGui's
-       top bar does not change when the panel is the active window, and
-       so Ctrl+T -- looked up in the menus of the window that has the
-       focus -- hides the panel from inside it. */
+       top bar stays familiar while the panel is the active window.
+       The assistant shortcut works independently of these menus. */
 #ifdef USE_MDI
     if (ismdi() && (RguiMDI & RW_TOOLBAR)) {
 	int btsize = 24;
@@ -3829,8 +3822,6 @@ static int ai_create(void)
     newmenu(G_("File"));
     newmenuitem(G_("New script"), 0, menueditornew);
     newmenuitem(G_("Open script..."), 0, menueditoropen);
-    newmenuitem("-", 0, NULL);
-    newmenuitem(G_("Hide AI assistant"), 0, ai_menu_close);
     newmenu(G_("Edit"));
     newmenuitem(G_("Copy"), 'C', ai_do_edit_copy);
     newmenuitem(G_("Paste"), 'V', ai_do_edit_paste);
@@ -3853,8 +3844,6 @@ static int ai_create(void)
     newmenuitem(G_("Remove pictures"), 0, ai_do_attach_remove);
     newmenu(G_("Misc"));
     newmenuitem(G_("Stop the answer or the download"), 0, ai_do_stop);
-    newmenuitem("-", 0, NULL);
-    newmenuitem(G_("AI assistant"), aichat_hotkey(), ai_menu_toggle);
     g_pmenu = (PkgMenuItems) malloc(sizeof(struct structPkgMenuItems));
     if (g_pmenu) RguiPackageMenu(g_pmenu);
 #ifdef USE_MDI

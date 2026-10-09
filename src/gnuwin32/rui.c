@@ -512,9 +512,12 @@ static void menudebug(control m)
     breaktodebugger();
 }
 
-static void menuaichat(control m)
+static int assistantkey(int key, int modifiers, int repeat)
 {
-    aichat_toggle();
+    if (modifiers != CtrlKey || !aichat_enabled() || key != aichat_hotkey())
+        return 0;
+    if (!repeat) aichat_toggle();
+    return 1;
 }
 
 static void menuls(control m)
@@ -1273,10 +1276,7 @@ int setupui(void)
     MCHECK(mls = newmenuitem(G_("List objects"), 0, menuls));
     MCHECK(mrm = newmenuitem(G_("Remove all objects"), 0, menurm));
     MCHECK(msearch = newmenuitem(G_("List search &path"), 0, menusearch));
-    if (aichat_enabled()) {
-	MCHECK(newmenuitem("-", 0, NULL));
-	MCHECK(newmenuitem(G_("AI assistant"), aichat_hotkey(), menuaichat));
-    }
+    setkeyfilter(assistantkey);
 
     pmenu = (PkgMenuItems) malloc(sizeof(struct structPkgMenuItems));
     RguiPackageMenu(pmenu);

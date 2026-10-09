@@ -20,6 +20,11 @@ Note lookup is bounded lexical selection, not an embedding service. Each request
 reads the editable prompt and reference files. Text and pictures are retained
 for bounded follow-ups. There is no training pass or automatic code execution.
 
+The window is created on the first shortcut and is never restored at startup.
+GraphApp filters the configured Ctrl+letter before menu accelerators, covering
+the console, editor and native assistant controls. Auto-repeat is consumed
+without toggling again, and modal dialogs keep their normal keyboard handling.
+
 ## Source map
 
 | Location | Responsibility |
@@ -27,7 +32,7 @@ for bounded follow-ups. There is no training pass or automatic code execution.
 | [aichat.c](../src/gnuwin32/aichat.c), [aichat.h](../src/gnuwin32/aichat.h) | Configuration, window, context, workers, HTTP/SSE, downloads, cancellation, history, editor actions |
 | [aiimage.c](../src/gnuwin32/aiimage.c), [aiimage.h](../src/gnuwin32/aiimage.h) | GDI+ decoding, scaling, encoding, clipboard, thumbnails, picture viewer |
 | [aiplot.c](../src/gnuwin32/aiplot.c) | Export from the R Windows graphics device |
-| [rui.c](../src/gnuwin32/rui.c) | Main menu integration |
+| [rui.c](../src/gnuwin32/rui.c) | Menu-independent shortcut registration |
 | [system.c](../src/gnuwin32/system.c) | Assistant shutdown during RGui exit |
 | [Makefile](../src/gnuwin32/Makefile), [Rdll.hide](../src/gnuwin32/Rdll.hide) | Compilation, Windows libraries, exported-symbol control |
 | [fixed/ai](../src/gnuwin32/fixed/ai), [Rai.conf](../src/gnuwin32/fixed/etc/Rai.conf) | Installed defaults, prompt, notes scaffold, portable launcher |
@@ -41,7 +46,7 @@ insertion into implicit evaluation.
 
 ## Relationship to the other forks
 
-RGui AI, RStudio AI, and GUSEK AI share the local-model approach, pinned assets,
+RGui AI, RStudio, and GUSEK AI share the local-model approach, pinned assets,
 explicit attachments, note lookup, and user-reviewed code actions. They are
 separate applications, not a shared live service. Defaults use ports 8713,
 18713, and 28713 respectively, with separate profiles and process ownership.

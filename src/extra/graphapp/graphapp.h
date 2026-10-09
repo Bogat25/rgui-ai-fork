@@ -562,6 +562,7 @@ typedef void (*imfn)(control c, font *f, point *xy);
 #define setim		GA_setim
 #define setkeyaction		GA_setkeyaction
 #define setkeydown		GA_setkeydown
+#define setkeyfilter		GA_setkeyfilter
 #define setlimittext		GA_setlimittext
 #define setlinewidth		GA_setlinewidth
 #define setlistitem		GA_setlistitem
@@ -1057,6 +1058,10 @@ void	setresize(control c, drawfn fn);
 
 void	setkeydown(control c, keyfn fn);
 void	setkeyaction(control c, keyfn fn);
+
+/* Application shortcuts independent of menus. Return non-zero to consume
+   a key; repeat is non-zero for auto-repeat. Modal dialogs are excluded. */
+void	setkeyfilter(int (*fn)(int key, int modifiers, int repeat));
 
 void	setmousedown(control c, mousefn fn);
 void	setmousedrag(control c, mousefn fn);

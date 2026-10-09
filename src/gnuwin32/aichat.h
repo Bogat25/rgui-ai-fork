@@ -30,12 +30,11 @@ void aichat_toggle(void);
    Called from the RGui shutdown path.  Safe to call when nothing started. */
 void aichat_shutdown(void);
 
-/* Non-zero if the assistant is enabled in etc/Rai.conf.  Used to decide
-   whether to create the menu entry at all. */
+/* Non-zero if the assistant shortcut is enabled in etc/Rai.conf. */
 int aichat_enabled(void);
 
-/* Accelerator letter for the menu entry, from etc/Rai.conf (default 'T').
-   Returns 0 if no accelerator was requested. */
+/* Shortcut letter, used with Ctrl, from etc/Rai.conf (default 'T').
+   Returns 0 if no shortcut was requested. */
 int aichat_hotkey(void);
 
 #endif /* R_GNUWIN32_AICHAT_H */

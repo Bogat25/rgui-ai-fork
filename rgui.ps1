@@ -28,7 +28,7 @@
         run       start the built Rgui with the AI payload in place
         dev       quick, then run
         test      static checks + tests; -Real drives the real model,
-                  -Gui drives the built Rgui.exe (menu, panel, buttons),
+                  -Gui drives the built Rgui.exe (shortcut, panel, buttons),
                   -Installer installs, upgrades and uninstalls the setup.exe
         package   assemble the pendrive layout in <BuildRoot>\dist
         installer build RGui-AI-<version>-setup.exe (Inno Setup; the model
@@ -70,6 +70,8 @@ param(
 
     # test: also drive the built Rgui.exe through its window messages.
     [switch]$Gui,
+    # With -Gui, check startup and shortcut access without the clipboard/model suites.
+    [switch]$ShortcutOnly,
 
     # test: also install the last built installer into a folder with a
     # space in its name, start it, upgrade it and uninstall it.
@@ -528,7 +530,7 @@ function Start-DevRgui([switch]$NoPayload) {
     $vars['TMP']            = $vars['TMPDIR']
     $vars['TEMP']           = $vars['TMPDIR']
     $p = [System.Diagnostics.Process]::Start($psi)
-    Say ("Rgui started (pid {0}).  Misc > AI assistant, or Ctrl+T." -f $p.Id)
+    Say ("Rgui started (pid {0}).  Ctrl+T toggles the assistant." -f $p.Id)
     Note "R_HOME  $Tree"
     Note "R_USER  $DevHome"
     return $p
@@ -537,6 +539,24 @@ function Start-DevRgui([switch]$NoPayload) {
 function Invoke-GuiTests {
     if (-not (Test-Built)) { Stop-WithError "the GUI test needs a build; run '.\rgui full' first." }
     $smoke = Join-Path $Tree 'src\gnuwin32\aitests\gui_smoke.ps1'
+    if ($ShortcutOnly) {
+        $conf = Join-Path $Tree 'etc\Rai.conf'
+        $backup = "$conf.shortcut-test-backup"
+        Copy-Item -LiteralPath $conf -Destination $backup
+        try {
+            Add-Content -LiteralPath $conf -Encoding ASCII -Value @(
+                '', '# isolated shortcut test overrides', 'hotkey = T',
+                'model = ai/system_prompt.txt', 'model_url =', 'vision = no',
+                'server_exe = ai/missing-shortcut-test-server.exe')
+            $p = Start-DevRgui -NoPayload
+            & $smoke -ProcessId $p.Id -ProbeDir (Join-Path $DevHome 'shortcut-probe') -TreeDir $Tree -ShortcutOnly
+            if ($LASTEXITCODE -ne 0) { Stop-WithError 'Assistant shortcut GUI checks failed.' }
+        } finally {
+            Stop-DevProcesses
+            Move-Item -LiteralPath $backup -Destination $conf -Force
+        }
+        return
+    }
     $probe = Join-Path $DevHome 'probe'
     Install-Payload
     $model = Join-Path $Tree "ai\models\$ModelFile"

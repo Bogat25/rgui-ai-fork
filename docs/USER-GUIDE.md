@@ -35,7 +35,8 @@ before upgrades or removal; do not depend on uninstall as a data-erasure tool.
 
 ## Ask and review
 
-Open **Misc > AI assistant** or **Ctrl+T**. Enter adds a newline and Ctrl+Enter
+Press **Ctrl+T** to open or close the assistant. It starts closed; there are no
+assistant menu entries or toolbar buttons. Enter adds a newline and Ctrl+Enter
 sends. The model warms when the window opens. **Stop** cancels generation or
 pauses downloading. Hiding the window preserves the chat; **New chat** clears it.
 Conversation state is in memory and is not a persistent chat archive.

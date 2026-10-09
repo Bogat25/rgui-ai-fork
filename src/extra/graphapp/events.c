@@ -1360,9 +1360,25 @@ long currenttime(void)
  *  Intercept menu keys, since we don't always have accelerator tables.
  *  Return 1 if doing something which should not go to the winproc, else 0.
  */
+static int (*keyfilter)(int, int, int) = NULL;
+
+void setkeyfilter(int (*fn)(int, int, int))
+{
+    keyfilter = fn;
+}
+
 static int TranslateMenuKeys(MSG *msg)
 {
     int key = LOWORD(msg->wParam);
+
+    if (keyfilter && menus_active && msg->message == WM_KEYDOWN) {
+        int modifiers = 0;
+        if (GetKeyState(VK_CONTROL) & 0x8000) modifiers |= CtrlKey;
+        if (GetKeyState(VK_SHIFT) & 0x8000) modifiers |= ShiftKey;
+        if (GetKeyState(VK_MENU) & 0x8000) modifiers |= AltKey;
+        if (keyfilter(key, modifiers, (msg->lParam & (1L << 30)) != 0))
+            return 1;
+    }
 
     /* Translate F10 from syskey to normal keydown message. */
     if ((key == VK_F10) && (msg->message == WM_SYSKEYDOWN))

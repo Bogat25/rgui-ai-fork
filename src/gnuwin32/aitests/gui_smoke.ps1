@@ -8,6 +8,9 @@
     clicks, text and keystrokes are all sent as window messages, so the
     test runs the same on any screen and needs no focus.
 
+    -ShortcutOnly checks startup, menus and the real keyboard event path without
+    reading or changing the clipboard, downloading models or asking a model.
+
     Exit code: the number of failed checks.
 #>
 param(
@@ -15,6 +18,7 @@ param(
     [Parameter(Mandatory = $true)] [string]$ProbeDir,
     [Parameter(Mandatory = $true)] [string]$TreeDir,
     [switch]$WithModel,
+    [switch]$ShortcutOnly,
     [int]$AnswerTimeout = 600,
 
     # First-run download pass: answer the offer with Yes and expect the
@@ -59,6 +63,11 @@ public static class Win {
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     static extern int GetClassNameW(IntPtr h, StringBuilder s, int max);
     [DllImport("user32.dll")] static extern int GetWindowLongW(IntPtr h, int idx);
+    [DllImport("user32.dll")] static extern bool AttachThreadInput(uint from, uint to, bool attach);
+    [DllImport("user32.dll")] static extern bool GetKeyboardState(byte[] state);
+    [DllImport("user32.dll")] static extern bool SetKeyboardState(byte[] state);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int command);
     [DllImport("user32.dll", EntryPoint = "SendMessageTimeoutW")]
     static extern IntPtr SmtoInt(IntPtr h, uint m, IntPtr w, IntPtr l, uint f, uint t, out IntPtr r);
     [DllImport("user32.dll", EntryPoint = "SendMessageTimeoutW", CharSet = CharSet.Unicode)]
@@ -67,6 +76,35 @@ public static class Win {
     static extern IntPtr SmtoBuf(IntPtr h, uint m, IntPtr w, StringBuilder l, uint f, uint t, out IntPtr r);
 
     const uint SMTO_ABORTIFHUNG = 2;
+
+    // Share keyboard state with the owned GUI thread, without moving focus.
+    public static byte[] BeginShortcut(IntPtr target, bool repeat) {
+        uint pid;
+        uint owner = GetWindowThreadProcessId(target, out pid);
+        if (!AttachThreadInput(GetCurrentThreadId(), owner, true))
+            throw new InvalidOperationException("Cannot attach test keyboard state");
+        var saved = new byte[256];
+        if (!GetKeyboardState(saved)) {
+            AttachThreadInput(GetCurrentThreadId(), owner, false);
+            throw new InvalidOperationException("Cannot save test keyboard state");
+        }
+        var state = (byte[]) saved.Clone();
+        state[0x11] = 0x80; state[0x10] = 0; state[0x12] = 0;
+        if (!SetKeyboardState(state) ||
+            !PostMessageW(target, 0x0100, (IntPtr) 'T', (IntPtr) (1L | (repeat ? 1L << 30 : 0)))) {
+            SetKeyboardState(saved);
+            AttachThreadInput(GetCurrentThreadId(), owner, false);
+            throw new InvalidOperationException("Cannot post test shortcut");
+        }
+        return saved;
+    }
+    public static void EndShortcut(IntPtr target, byte[] saved) {
+        uint pid;
+        uint owner = GetWindowThreadProcessId(target, out pid);
+        PostMessageW(target, 0x0101, (IntPtr) 'T', (IntPtr) 0xC0000001L);
+        SetKeyboardState(saved);
+        AttachThreadInput(GetCurrentThreadId(), owner, false);
+    }
 
     public static List<IntPtr> TopWindows(int pid) {
         var list = new List<IntPtr>();
@@ -301,20 +339,24 @@ function Test-ConsoleRuns([IntPtr]$Console, [double]$Seconds) {
 New-Item -ItemType Directory -Force -Path $ProbeDir | Out-Null
 
 # The Copy code check writes to the clipboard; put the user's text back.
-$savedClipboard = Get-Clip
+$savedClipboard = $null
+if (-not $ShortcutOnly) {
+    $savedClipboard = Get-Clip
 
-# Several checks go through the clipboard (console input, Copy code).  If
-# Windows refuses clipboard access to every program, which happens on a
-# locked session and elsewhere, say so up front: otherwise those checks
-# fail looking like RGui bugs.
-$clipUsable = (Set-Clip 'rgui-gui-test') -and ((Get-Clip) -eq 'rgui-gui-test')
-Check 'Windows clipboard is usable (needed by several checks)' $clipUsable `
-      'even clip.exe is refused: unlock the session or close whatever holds the clipboard, then rerun'
+    # Several checks go through the clipboard (console input, Copy code).  If
+    # Windows refuses clipboard access to every program, which happens on a
+    # locked session and elsewhere, say so up front: otherwise those checks
+    # fail looking like RGui bugs.
+    $clipUsable = (Set-Clip 'rgui-gui-test') -and ((Get-Clip) -eq 'rgui-gui-test')
+    Check 'Windows clipboard is usable (needed by several checks)' $clipUsable `
+          'even clip.exe is refused: unlock the session or close whatever holds the clipboard, then rerun'
+}
 
 $frame = [IntPtr]::Zero
 $found = Wait-Until {
     foreach ($h in [Win]::TopWindows($ProcessId)) {
-        if ([Win]::IsWindowVisible($h) -and [Win]::GetMenu($h) -ne [IntPtr]::Zero) {
+        if (([Win]::IsWindowVisible($h) -or $ShortcutOnly) -and [Win]::GetMenu($h) -ne [IntPtr]::Zero) {
+            if ($ShortcutOnly) { [void][Win]::ShowWindow($h, 5) }
             $script:frame = $h; return $true
         }
     }
@@ -334,16 +376,29 @@ Start-Sleep -Seconds 5
 $pasteTop = $null
 $script:PasteCmd = [Win]::FindCommand([Win]::GetMenu($frame), 'Paste', [ref]$pasteTop)
 Check 'console Edit > Paste command found' ($script:PasteCmd -ge 0)
-Check 'console runs R code typed at it (baseline)' (Test-ConsoleRuns $console 30) `
-      'pasting into the console did not work, so the concurrency check below means nothing'
+if (-not $ShortcutOnly) {
+    Check 'console runs R code typed at it (baseline)' (Test-ConsoleRuns $console 30) `
+          'pasting into the console did not work, so the concurrency check below means nothing'
+}
 
 $top = $null
 $cmd = [Win]::FindCommand([Win]::GetMenu($frame), 'AI assistant', [ref]$top)
-Check 'menu entry "AI assistant" exists' ($cmd -ge 0)
-Check 'menu entry is in the Misc menu' ($top -eq 'Misc') "found in: $top"
-if ($cmd -lt 0) { exit 98 }
+Check 'assistant has no opening menu entry' ($cmd -lt 0)
+Check 'assistant starts closed' ((Find-ByText $frame 'R AI assistant') -eq [IntPtr]::Zero)
 
-function Toggle { [void][Win]::PostMessageW($frame, 0x0111, [IntPtr]$cmd, [IntPtr]::Zero) }  # WM_COMMAND
+function Toggle([IntPtr]$Target = $console, [switch]$Repeat) {
+    $h = Find-ByText $frame 'R AI assistant'
+    $before = $h -ne [IntPtr]::Zero -and [Win]::IsWindowVisible($h)
+    $expected = if ($Repeat) { $before } else { -not $before }
+    $savedKeys = [Win]::BeginShortcut($Target, [bool]$Repeat)
+    try {
+        Start-Sleep -Milliseconds 100
+        $null = Wait-Until {
+            $p = Find-ByText $frame 'R AI assistant'
+            ($p -ne [IntPtr]::Zero -and [Win]::IsWindowVisible($p)) -eq $expected
+        } 10
+    } finally { [Win]::EndShortcut($Target, $savedKeys) }
+}
 
 Toggle
 $panel = [IntPtr]::Zero
@@ -368,6 +423,36 @@ foreach ($b in 'Send', 'Stop', 'Copy code', 'To editor', 'New chat') {
 if (-not ($hist -and $inbox -and $buttons.ContainsKey('Send'))) { exit 96 }
 $send = $buttons['Send']; $stop = $buttons['Stop']
 Check 'transcript shows the welcome text' (([Win]::Text($hist)) -like '*Local R assistant*')
+
+if ($ShortcutOnly) {
+    $initial = [Win]::Text($hist)
+    Toggle -Target $inbox -Repeat
+    Check 'holding Ctrl+T does not repeatedly toggle' ([Win]::IsWindowVisible($panel))
+    Toggle -Target $inbox
+    Check 'Ctrl+T closes from the question box' (-not [Win]::IsWindowVisible($panel))
+    Toggle
+    Check 'Ctrl+T reopens from the console' ([Win]::IsWindowVisible($panel))
+    Check 'reopening preserves the transcript' ([Win]::Text($hist) -eq $initial)
+    $top = $null
+    Check 'assistant menu has no toggle entry' ([Win]::FindCommand([Win]::GetMenu($frame), 'AI assistant', [ref]$top) -lt 0)
+    Check 'assistant menu has no hide entry' ([Win]::FindCommand([Win]::GetMenu($frame), 'Hide AI assistant', [ref]$top) -lt 0)
+    Toggle -Target $hist
+    Check 'Ctrl+T closes from the transcript' (-not [Win]::IsWindowVisible($panel))
+    $newScript = [Win]::FindCommand([Win]::GetMenu($frame), 'New script', [ref]$top)
+    Check 'script editor command remains available' ($newScript -ge 0)
+    Post-Command $newScript
+    $null = Wait-Until { (Find-ByText $frame 'R Editor') -ne [IntPtr]::Zero } 10
+    $editor = Find-ByText $frame 'R Editor'
+    Check 'script editor opens' ($editor -ne [IntPtr]::Zero)
+    if ($editor -ne [IntPtr]::Zero) {
+        Toggle -Target $editor
+        Check 'Ctrl+T opens from the script editor' ([Win]::IsWindowVisible($panel))
+        Toggle -Target $inbox
+        Check 'Ctrl+T closes again after opening from the editor' (-not [Win]::IsWindowVisible($panel))
+    }
+    Write-Host ("Shortcut GUI checks: {0} failures" -f $script:Failures)
+    exit $script:Failures
+}
 
 # The status line is the panel's GraphApp label, window class "Rgui".
 $statusLabel = [Win]::Descendants($panel) | Where-Object { [Win]::ClassOf($_) -eq 'Rgui' -and [Win]::IsWindowVisible($_) } | Select-Object -First 1
@@ -449,10 +534,9 @@ if (-not $Canned) {
         Check ("panel menu bar has {0}" -f $m) ($names -contains $m) ("menus: " + ($names -join ', '))
     }
     $label = [Win]::FullLabel($bar, 'AI assistant')
-    Check 'panel Misc menu has AI assistant with its Ctrl+T' ($label -and $label.Contains('Ctrl+T')) "label: $label"
+    Check 'panel has no assistant toggle menu entry' (-not $label)
 }
 $ptop = $null
-$panelToggle = [Win]::FindCommand($bar, 'AI assistant', [ref]$ptop)
 $attErr = [Win]::FindCommand($bar, 'Last error from the console', [ref]$ptop)
 $attScript = [Win]::FindCommand($bar, 'Current script', [ref]$ptop)
 $attCon = [Win]::FindCommand($bar, 'Recent console output', [ref]$ptop)
@@ -462,8 +546,8 @@ $attRemove = [Win]::FindCommand($bar, 'Remove pictures', [ref]$ptop)
 $panelPaste = [Win]::FindCommand($bar, 'Paste', [ref]$ptop)
 
 if (-not $WithModel -and -not $Canned) {
-    Post-Command $panelToggle
-    Check "the panel's own AI assistant command hides it" (Wait-Until { -not [Win]::IsWindowVisible($panel) } 5)
+    Toggle -Target $inbox
+    Check 'Ctrl+T from the question box hides the panel' (Wait-Until { -not [Win]::IsWindowVisible($panel) } 5)
     Toggle
     $null = Wait-Until { [Win]::IsWindowVisible($panel) } 5
 

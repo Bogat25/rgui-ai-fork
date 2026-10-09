@@ -37,7 +37,7 @@ packages, and user code can still access the network.
    target. Packages are currently unsigned.
 3. Start **RGui AI** from its shortcut. For a portable copy, use `Start-R.cmd`
    beside the `R` directory.
-4. Open **Misc > AI assistant**, or press **Ctrl+T**. Accept the initial model
+4. Press **Ctrl+T** to open the assistant. Accept the initial model
    and picture-reader download, approximately **3.4 GB** in total.
 5. Type a question and select **Send** or press **Ctrl+Enter**. **Stop** cancels
    an answer or pauses a download; **New chat** clears the conversation.
@@ -53,6 +53,11 @@ packaged installation. Edit `R/ai/system_prompt.txt` for standing instructions.
 Files are read for each question; there is no training or indexing step.
 Model settings live in `R/etc/Rai.conf`. Keep private notes and real conversations
 outside the source repository.
+
+The assistant starts closed. **Ctrl+T** is its only opening control and also
+hides it again, including from the question box. Hiding preserves the current
+conversation; there are no assistant menu entries or toolbar buttons. The
+shortcut letter is configurable in `etc/Rai.conf`.
 
 ## Build from source
 

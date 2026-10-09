@@ -79,7 +79,7 @@ say), use `rgui full` instead; it is incremental too.
 |---|---|---|
 | `rgui test` | `aichat.c` compiles warning-free with the production flags; JSON, SSE, chunked HTTP, the `<think>` filter, Stop and a missing server behave; captured real `llama-server` output parses correctly; on real RichEdit controls, Markdown renders without its markup, emoji and characters Consolas lacks get fonts that have them, typed or set text in any script arrives whole; while an answer streams, a transcript scrolled up stays where it is, a selection is kept, and nothing is written while the mouse button is down in it; pictures are scaled and encoded (JPEG for photos), go into the request before the question, stay for follow-ups up to 4 per request and are left out without the picture reader; the model and the picture reader download in one go, or the reader alone; in the transcript (msftedit's RichEdit) a sent picture shows as a thumbnail that a click opens; the strip of attached pictures opens one on a click and removes one with its x | ~10 s |
 | `rgui test -Real` | `aichat.c` starts the real `llama-server` itself (with the picture reader), the model loads, answers with a fenced code block, reads the number in a picture, and the server is stopped again | ~1 min |
-| `rgui test -Gui` | drives the built `Rgui.exe` through window messages: menu entry, panel, all buttons, hide/show/close, Copy code, To editor, R running console code **while** the model answers, the first-run download offer and the download itself, a missing model failing politely, the panel's full menu bar with Ctrl+T, the Attach menu, answers without code (reported, clipboard untouched), To editor into an already open script, a question in Hungarian, Greek, Chinese and emoji reaching the transcript unchanged, answers shown without their Markdown code fences, Attach > Current plot sending the plot itself even with the panel covering it (checked by its colours, as the fake server received it), a click on an attached thumbnail opening it, a follow-up still carrying the picture, a screenshot pasted from the clipboard, its x and Remove pictures, the real model recognising a boxplot, and `llama-server` dying with Rgui | ~3–4 min |
+| `rgui test -Gui` | drives the built `Rgui.exe` through window messages: keyboard shortcut, panel, all buttons, hide/show/close, Copy code, To editor, R running console code **while** the model answers, the first-run download offer and the download itself, a missing model failing politely, the panel's full menu bar and menu-independent Ctrl+T, the Attach menu, answers without code (reported, clipboard untouched), To editor into an already open script, a question in Hungarian, Greek, Chinese and emoji reaching the transcript unchanged, answers shown without their Markdown code fences, Attach > Current plot sending the plot itself even with the panel covering it (checked by its colours, as the fake server received it), a click on an attached thumbnail opening it, a follow-up still carrying the picture, a screenshot pasted from the clipboard, its x and Remove pictures, the real model recognising a boxplot, and `llama-server` dying with Rgui | ~3–4 min |
 | `rgui test -Installer` | installs the last built setup.exe into a folder whose name has a space in it, starts RGui from the Start-menu launcher, upgrades over it (your `Rai.conf`, prompt and notes must survive) and uninstalls it (the program and model go, your `work` folder stays) | ~1 min |
 
 When something fails, the script prints the first error lines of the
@@ -97,7 +97,7 @@ clipboard for the Copy code check and puts your text back afterwards.
 | `src/gnuwin32/aichat.c`, `aichat.h` | new, the whole feature |
 | `src/gnuwin32/aiimage.c`, `aiimage.h` | new, pictures: files, the clipboard, scaling and encoding (GDI+), the picture window and the strip of attached pictures |
 | `src/gnuwin32/aiplot.c` | new, reads a plot from its windows() device, as `savePlot()` does |
-| `src/gnuwin32/rui.c` | one menu entry in the Misc menu |
+| `src/gnuwin32/rui.c` | registers the menu-independent Ctrl+T shortcut |
 | `src/gnuwin32/system.c` | one call to `aichat_shutdown()` on exit |
 | `src/gnuwin32/Makefile` | the three files in `CSOURCES`; `-lws2_32 -lwinhttp -lbcrypt -lgdiplus` |
 | `src/gnuwin32/Rdll.hide` | keeps the new symbols out of R.dll's exports |
@@ -210,7 +210,7 @@ No indexing step, no restart: edit a file, ask the next question.
 
 1. Copy `E:\R\ai\Start-R.cmd` to `E:\Start-R.cmd`.
 2. Double-click it. RGui opens exactly as it always does.
-3. **Misc → AI assistant**, or Ctrl+T.
+3. **Ctrl+T** opens or closes the assistant; it always starts closed.
 4. Without the model, RGui offers to download it with its picture
    reader (3.4 GB, once). Say Yes and keep working in R; the status line
    shows the progress.
@@ -258,10 +258,10 @@ and packages remain available during model operations.
 | `The model server exited unexpectedly` | It died without printing an error. Run `llama-server.exe` by hand from a command prompt with the same `-m` argument and read its output. Usually a missing DLL or a corrupt download. |
 | `The model did not become ready within ...` | A slow stick. Raise `startup_timeout`. With llama.cpp b11153, `extra_args = --load-mode none` reads the model into RAM up front, which can help on slow USB sticks. |
 | `Could not connect to the model server` | Something else is on port 8713. Change `port` in `etc\Rai.conf`. |
-| Nothing happens at all, no menu entry | `enabled = no` in `etc\Rai.conf`, or the file has a typo. Delete it to fall back to the defaults. |
+| Nothing happens when pressing the shortcut | `enabled = no` in `etc\Rai.conf`, or the file has a typo. Delete it to fall back to the defaults. |
 
-To turn the whole feature off, set `enabled = no`. The menu entry then
-does not appear and no assistant code runs.
+To turn the whole feature off, set `enabled = no`. The shortcut becomes
+inactive and no assistant panel or model process starts.
 
 ## 9. What it does not do
 

@@ -30,6 +30,7 @@ download behavior are defined in [rgui.ps1](../rgui.ps1) and
 | `rgui.cmd test` | Compile checks, native unit/protocol/control regressions |
 | `rgui.cmd test -Real` | Include actual model startup, generation, and picture inference |
 | `rgui.cmd test -Gui` | Exercise built RGui menus, controls, attachments, and lifecycle |
+| `rgui.cmd test -Gui -ShortcutOnly` | Native checks and assistant startup/keyboard controls without clipboard access or models |
 | `rgui.cmd test -Installer` | Install, launch, upgrade, and uninstall the built installer |
 
 Pass the same `-BuildRoot` and optional `-Rtools` to each command. Real and GUI
