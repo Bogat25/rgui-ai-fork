@@ -5,13 +5,91 @@ This guide applies to all three forks. Each repository contains the same
 specific Windows build workflow. No SourceForge account or project has been
 created by these files.
 
+## Copy-and-paste project details
+
+Create these three projects at <https://sourceforge.net/create/>. The suggested
+URL names below have not been reserved or checked for availability. If one is
+taken, append `-b25` and use that actual name in `SOURCEFORGE_PROJECT`.
+SourceForge documents URL names as 3-30 letters, numbers or dashes; changing one
+later requires support, so choose it before configuring the release environment.
+
+| Field | RGui | RStudio | GUSEK |
+| --- | --- | --- | --- |
+| Project name | RGui AI | RStudio (Local Assistant Fork) | GUSEK AI |
+| URL name | `rgui-local-ai` | `rstudio-local-assistant` | `gusek-local-ai` |
+| Homepage / source code | <https://github.com/Bogat25/RGui-fork> | <https://github.com/Bogat25/rstudio> | <https://github.com/Bogat25/Gusek> |
+| Support URL | <https://github.com/Bogat25/RGui-fork/issues> | <https://github.com/Bogat25/rstudio/issues> | <https://github.com/Bogat25/Gusek/issues> |
+| Primary application license | GNU GPL v2 or later | GNU AGPL v3 | GNU GPL v3 or later |
+| Suggested tags | R, statistics, local AI, offline | R, IDE, statistics, local AI, offline | MathProg, GLPK, optimization, local AI, offline |
+
+The license entries describe the applications. Bundled R, model files,
+llama.cpp and other components keep their own licenses and notices. The
+SourceForge display name for the RStudio fork does not rename the installed
+application, which remains **RStudio**.
+
+Use the following text for the short summary and full description fields.
+
+### RGui AI
+
+Short summary:
+
+```text
+R for Windows with an offline assistant for code and statistics.
+```
+
+Full description:
+
+```text
+RGui AI is an independent fork of R for Windows with a local AI assistant for statistics, R code, plots, pictures, and course notes. The complete offline installer includes R, the llama.cpp CPU runtime, Qwen3.5-4B, and its picture reader. The local assistant runs without a cloud AI account or GPU. Users review and run suggested code themselves. This is not an official R Project distribution. Source code and issue tracking are maintained on GitHub.
+```
+
+### RStudio (Local Assistant Fork)
+
+Short summary:
+
+```text
+RStudio Desktop fork with an offline assistant for R and statistics.
+```
+
+Full description:
+
+```text
+This independent RStudio Desktop fork adds a local AI assistant for R code, statistics, plots, pictures, and reference notes. The complete offline installer includes the IDE, R, the llama.cpp CPU runtime, Qwen3.5-4B, and its picture reader. The local assistant runs without a cloud AI account or GPU. Users review and run suggested code themselves. This is not an official Posit product or distribution. Source code and issue tracking are maintained on GitHub.
+```
+
+### GUSEK AI
+
+Short summary:
+
+```text
+MathProg and GLPK editor with an offline optimization assistant.
+```
+
+Full description:
+
+```text
+GUSEK AI is an independent Windows MathProg and GLPK editor fork with a local AI assistant for optimization models, solver output, pictures, and reference notes. The complete offline installer includes the editor, GLPK solver, llama.cpp CPU runtime, Qwen3.5-4B, and its picture reader. The local assistant runs without a cloud AI account or GPU. Users review and run generated models themselves. This is not an official GUSEK, GLPK, SciTE, or Scintilla release. Source code and issue tracking are maintained on GitHub.
+```
+
+For all three projects, enable **Files / Downloads**, select **Windows** as the
+supported operating system and **English** as the interface language. Suggested
+categories are Science/Engineering and Mathematics, with Software Development
+for RStudio if offered. **Beta** is a suitable initial development status for
+these unsigned fork releases. Use GitHub for source and issues; a second Git
+repository, tracker or wiki on SourceForge is optional.
+
+You can use the same SourceForge publishing account and dedicated CI key for all
+three projects. Your SourceForge login need not match your GitHub username.
+The first project may require phone verification; complete that in the browser.
+No OAuth application or MCP token is needed for this manual setup.
+
 ## One-time SourceForge setup
 
 1. Create and verify a [SourceForge account](https://sourceforge.net/user/registration).
 2. [Create one project](https://sourceforge.net/create/) for each independent
    fork. Enable the Files tool and use a description that identifies the project
-   as an independent fork. Example project slugs are `rgui-local-ai`,
-   `rstudio-local-assistant`, and `gusek-local-ai`; availability is not assumed.
+   as an independent fork. Use the copy-and-paste project details above;
+   availability of the proposed URL names is not assumed.
    Enter the corresponding GitHub repository as the source-code/homepage link.
    Code development can remain on GitHub.
 3. The publishing account must be a project administrator or have permission to
@@ -23,6 +101,16 @@ created by these files.
    run `ssh-keygen -t ed25519 -C sourceforge-releases` and choose a new filename
    when prompted. This command prompts for a passphrase; leave it empty for
    this dedicated CI key.
+
+   To choose the filename explicitly in PowerShell:
+
+   ```powershell
+   New-Item -ItemType Directory -Force "$env:USERPROFILE\.ssh" | Out-Null
+   ssh-keygen -t ed25519 -C "sourceforge-releases" -f "$env:USERPROFILE\.ssh\sourceforge-releases"
+   ```
+
+   Choose a new filename if that key already exists. The `.pub` file is the
+   public key; the matching file without `.pub` is the private key.
 5. In [SourceForge account services](https://sourceforge.net/auth/shell_services),
    add **only the public `.pub` key** to SSH keys. SourceForge accepts public
    keys; the private key belongs in the GitHub environment secret below.
@@ -47,6 +135,11 @@ Add these **environment variables**:
 | --- | --- |
 | `SOURCEFORGE_PROJECT` | This application's actual SourceForge project slug, not its display name or URL |
 | `SOURCEFORGE_USERNAME` | SourceForge login username of the publishing account |
+
+With the proposed names, `SOURCEFORGE_PROJECT` is `rgui-local-ai` in
+`Bogat25/RGui-fork`, `rstudio-local-assistant` in `Bogat25/rstudio`, and
+`gusek-local-ai` in `Bogat25/Gusek`. Substitute any actual names that differ.
+`SOURCEFORGE_USERNAME` is the same publishing login in all three environments.
 
 Add these **environment secrets**:
 
