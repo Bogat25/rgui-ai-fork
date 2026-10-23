@@ -7,9 +7,7 @@
 ;
 ; Needs Inno Setup 7.
 ;
-; The model is not in the installer (2.7 GB, and GitHub release assets
-; are limited to 2 GB): RGui offers to download it the first time the
-; assistant is opened.
+; Offline builds include both verified models through OfflineModelsInclude.
 
 #ifndef AppVersion
   #define AppVersion "0.0.0-dev"
@@ -23,13 +21,24 @@
 #ifndef OutputDir
   #define OutputDir "."
 #endif
+#ifndef AppIdValue
+  #define AppIdValue "{{A1E92B8A-2AFD-45A8-BAF7-C1803C90FB17}"
+#endif
+#ifndef AppNameValue
+  #define AppNameValue "RGui AI"
+#endif
+#ifdef OfflineModelsInclude
+  #define InstallerSuffix "-offline"
+#else
+  #define InstallerSuffix ""
+#endif
 
 [Setup]
 ; Never change AppId: upgrades find the earlier install through it.
-AppId={{A1E92B8A-2AFD-45A8-BAF7-C1803C90FB17}
-AppName=RGui AI
+AppId={#AppIdValue}
+AppName={#AppNameValue}
 AppVersion={#AppVersion}
-AppVerName=RGui AI {#AppVersion}
+AppVerName={#AppNameValue} {#AppVersion}
 AppPublisher=RGui AI
 AppComments=R 4.6.1 with a local AI assistant for statistics coursework
 VersionInfoVersion={#NumericVersion}
@@ -40,14 +49,14 @@ VersionInfoProductName=RGui AI
 ; administrator rights are needed, and any folder can be chosen,
 ; a pendrive included.
 PrivilegesRequired=lowest
-DefaultDirName={autopf}\RGui AI
+DefaultDirName={autopf}\{#AppNameValue}
 DisableProgramGroupPage=yes
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 ; Windows 10 1903: RGui relies on the UTF-8 active code page from then on.
 MinVersion=10.0.18362
 OutputDir={#OutputDir}
-OutputBaseFilename=RGui-AI-{#AppVersion}-setup
+OutputBaseFilename=RGui-AI-{#AppVersion}{#InstallerSuffix}-setup
 SetupIconFile=..\src\gnuwin32\front-ends\R.ico
 UninstallDisplayIcon={app}\R\bin\x64\Rgui.exe
 UninstallDisplayName=RGui AI {#AppVersion}
@@ -63,7 +72,7 @@ Name: desktopicon; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm
 
 [Files]
 ; Everything, except the two files people edit ...
-Source: "{#StageDir}\*"; DestDir: "{app}"; Excludes: "\R\etc\Rai.conf,\R\ai\system_prompt.txt"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#StageDir}\*"; DestDir: "{app}"; Excludes: "\R\etc\Rai.conf,\R\ai\system_prompt.txt,*.gguf,*.gguf.part"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; ... which an upgrade must not overwrite.
 Source: "{#StageDir}\R\etc\Rai.conf"; DestDir: "{app}\R\etc"; Flags: onlyifdoesntexist
 Source: "{#StageDir}\R\ai\system_prompt.txt"; DestDir: "{app}\R\ai"; Flags: onlyifdoesntexist
@@ -74,16 +83,22 @@ Name: "{app}\R\ai\context"
 
 [UninstallDelete]
 ; The model arrived after installation, so Setup does not know about it.
-Type: files; Name: "{app}\R\ai\models\*.gguf"
-Type: files; Name: "{app}\R\ai\models\*.gguf.part"
+Type: files; Name: "{app}\R\ai\models\Qwen3.5-4B-Q4_K_M.gguf"
+Type: files; Name: "{app}\R\ai\models\Qwen3.5-4B-Q4_K_M.gguf.part"
+Type: files; Name: "{app}\R\ai\models\Qwen3.5-4B-mmproj-F16.gguf"
+Type: files; Name: "{app}\R\ai\models\Qwen3.5-4B-mmproj-F16.gguf.part"
 Type: filesandordirs; Name: "{app}\work\tmp"
 ; {app}\work itself (the R workspace, history and packages) is left alone.
 
 [Icons]
 ; Start-R.cmd keeps R's workspace, history and packages inside the install
 ; folder, so a pendrive install behaves the same on every computer.
-Name: "{autoprograms}\RGui AI"; Filename: "{app}\Start-R.cmd"; WorkingDir: "{app}"; IconFilename: "{app}\R\bin\x64\Rgui.exe"; Flags: runminimized
-Name: "{autodesktop}\RGui AI"; Filename: "{app}\Start-R.cmd"; WorkingDir: "{app}"; IconFilename: "{app}\R\bin\x64\Rgui.exe"; Flags: runminimized; Tasks: desktopicon
+Name: "{autoprograms}\{#AppNameValue}"; Filename: "{app}\Start-R.cmd"; WorkingDir: "{app}"; IconFilename: "{app}\R\bin\x64\Rgui.exe"; Flags: runminimized
+Name: "{autodesktop}\{#AppNameValue}"; Filename: "{app}\Start-R.cmd"; WorkingDir: "{app}"; IconFilename: "{app}\R\bin\x64\Rgui.exe"; Flags: runminimized; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\Start-R.cmd"; WorkingDir: "{app}"; Description: "Start RGui now"; Flags: postinstall nowait skipifsilent runminimized shellexec
+
+#ifdef OfflineModelsInclude
+  #include OfflineModelsInclude
+#endif

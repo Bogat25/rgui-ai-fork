@@ -24,21 +24,21 @@ in place.
 
 The default assistant uses **Qwen3.5-4B Q4_K_M** and its multimodal projector
 through the **llama.cpp CPU runtime**. No cloud AI account, API key, GPU, Python,
-or Node installation is required to use the packaged assistant. Model downloads
-need a network connection; inference works offline after setup. Other R features,
+or Node installation is required to use the packaged assistant. Slim-package model downloads
+need a network connection; the complete offline installer includes those files. Other R features,
 packages, and user code can still access the network.
 
 ## Install and start
 
 1. Open this repository's **Releases** page and choose an installer from a
    successful version-tag build, if available. Check its adjacent SHA-256 file.
-2. Run `RGui-AI-<version>-setup.exe` and choose a writable installation folder.
+2. Follow the SourceForge download link, run `RGui-AI-<version>-offline-setup.exe`, and choose a writable installation folder.
    The installer targets Windows 10 1903+ x64; Windows 11 x64 is the development
    target. Packages are currently unsigned.
 3. Start **RGui AI** from its shortcut. For a portable copy, use `Start-R.cmd`
    beside the `R` directory.
-4. Press **Ctrl+T** to open the assistant. Accept the initial model
-   and picture-reader download, approximately **3.4 GB** in total.
+4. Press **Ctrl+T** to open the assistant. The offline installer already includes
+   both the model and picture reader; no model download is required.
 5. Type a question and select **Send** or press **Ctrl+Enter**. **Stop** cancels
    an answer or pauses a download; **New chat** clears the conversation.
 
@@ -65,16 +65,18 @@ Install Rtools45 and Python 3 for the test harness. From this checkout:
 
 ```powershell
 .\rgui.cmd doctor -BuildRoot C:\rgui-build
-.\rgui.cmd fetch -NoModel -BuildRoot C:\rgui-build
+.\rgui.cmd fetch -BuildRoot C:\rgui-build
 .\rgui.cmd full -BuildRoot C:\rgui-build
 .\rgui.cmd test -BuildRoot C:\rgui-build
-.\rgui.cmd installer -Version 0.1.0 -BuildRoot C:\rgui-build
+.\rgui.cmd installer -Offline -Version 0.1.0 -BuildRoot C:\rgui-build
 ```
 
 `0.1.0` is an example fork version. Use your intended version consistently.
 BuildRoot must be outside the checkout and contain no spaces. Omit `-NoModel`
 when fetching to enable real-model tests or prepare an offline portable copy.
-The installer excludes model weights and offers their download on first use.
+`installer -Offline` includes both verified models. Omit `-Offline` for a slim
+installer that downloads models on first use.
+See [SourceForge release setup](release/SOURCEFORGE.md) for automatic publishing.
 
 ## Documentation
 

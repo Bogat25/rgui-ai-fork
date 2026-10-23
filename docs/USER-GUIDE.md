@@ -5,7 +5,8 @@
 Use the installer and checksum from this fork's Releases page, when a release is
 available. It installs for the current user, with `PrivilegesRequired=lowest`.
 Select a writable folder. The installer contains R, the assistant, and the CPU
-runtime; the model and picture reader download separately.
+runtime. The SourceForge offline installer includes both models. Slim installers
+offer their download separately. See [release setup](../release/SOURCEFORGE.md).
 
 For a portable setup, assemble the distribution with `rgui.cmd package` and copy
 the contents of BuildRoot's `dist` directory to a writable folder or USB drive:

@@ -1,12 +1,3 @@
-# Build RGui AI and, for a v* tag, publish the installer as a GitHub release.
-#
-#   git tag v0.1.1 && git push origin v0.1.1      -> release "RGui AI 0.1.1"
-#   git tag v0.2.0-rc1 && git push origin v0.2.0-rc1 -> pre-release
-#   Actions tab > release > Run workflow          -> build and test only
-#
-# The model is not in the installer (2.7 GB; release assets are limited to
-# 2 GB): RGui downloads it the first time the assistant is opened.
-
 name: release
 
 on:
@@ -38,6 +29,8 @@ jobs:
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Work out the version
         id: version
@@ -60,13 +53,20 @@ jobs:
           "prerelease=$pre"  >> $env:GITHUB_OUTPUT
           Write-Host "version $v (prerelease: $pre)"
 
+      - name: Test release infrastructure
+        shell: pwsh
+        run: |
+          python -m unittest discover -s release -p 'test_*.py' -v
+          if ($LASTEXITCODE -ne 0) { throw 'Release publisher regressions failed.' }
+          .\release\test-offline.ps1
+
       - name: Cache downloads
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ${{ env.BUILD_ROOT }}\cache
             C:\rgui-dl
-          key: rgui-downloads-${{ env.RTOOLS_FILE }}-${{ hashFiles('rgui.ps1') }}
+          key: rgui-downloads-${{ env.RTOOLS_FILE }}-${{ hashFiles('rgui.ps1', 'release/assets.json') }}
           restore-keys: rgui-downloads-${{ env.RTOOLS_FILE }}-
 
       - name: Install Rtools45 (pinned, checksum verified)
@@ -87,7 +87,7 @@ jobs:
           Get-PSDrive C | ForEach-Object { 'C: {0:N0} GB free' -f ($_.Free / 1GB) }
 
       - name: Fetch Tcl/Tk, llama.cpp and Inno Setup (checksum verified)
-        run: .\rgui.cmd fetch -NoModel -BuildRoot $env:BUILD_ROOT -Rtools $env:RTOOLS_DIR
+        run: .\rgui.cmd fetch -BuildRoot $env:BUILD_ROOT -Rtools $env:RTOOLS_DIR
         shell: pwsh
 
       - name: Build R, base and recommended packages
@@ -101,53 +101,23 @@ jobs:
       - name: Build the installer
         env:
           VERSION: ${{ steps.version.outputs.version }}
-        run: .\rgui.cmd installer -Version $env:VERSION -BuildRoot $env:BUILD_ROOT -Rtools $env:RTOOLS_DIR
+        run: .\rgui.cmd installer -Offline -Version $env:VERSION -BuildRoot $env:BUILD_ROOT -Rtools $env:RTOOLS_DIR
         shell: pwsh
 
       - name: Test the installer (install, start, upgrade, uninstall)
-        run: .\rgui.cmd test -Installer -BuildRoot $env:BUILD_ROOT -Rtools $env:RTOOLS_DIR
+        run: .\rgui.cmd test -Installer -Offline -BuildRoot $env:BUILD_ROOT -Rtools $env:RTOOLS_DIR
         shell: pwsh
-
-      - name: Write release notes
-        shell: pwsh
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-          COMMIT: ${{ github.sha }}
-        run: |
-          $exe = "$env:BUILD_ROOT\installer\RGui-AI-$env:VERSION-setup.exe"
-          $sha = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant()
-          $mb  = '{0:N0}' -f ((Get-Item $exe).Length / 1MB)
-          @"
-          R 4.6.1 (RGui) with a local AI assistant for statistics coursework:
-          **Misc > AI assistant**, or **Ctrl+T**.
-
-          ### Install
-          Download ``RGui-AI-$env:VERSION-setup.exe`` ($mb MB) and run it. No administrator
-          rights are needed: it installs for the current user, or into any folder you choose,
-          a USB stick included. The installer is not code-signed, so Windows SmartScreen may
-          warn; choose *More info > Run anyway*.
-
-          ### First use of the assistant
-          RGui offers to download the AI model (Qwen3.5-4B, Q4_K_M, 2.7 GB). It is needed
-          once, downloads in the background while R stays usable, continues if interrupted,
-          and is checked against its published SHA-256. After that everything works offline.
-
-          ### Checksum
-          SHA-256 of the installer:
-          ``$sha``
-
-          Built from $env:COMMIT.
-          "@ | Set-Content -Encoding utf8 "$env:BUILD_ROOT\installer\release-notes.md"
 
       - name: Upload the installer
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: installer
           path: |
-            ${{ env.BUILD_ROOT }}\installer\RGui-AI-*-setup.exe
-            ${{ env.BUILD_ROOT }}\installer\RGui-AI-*-setup.exe.sha256
-            ${{ env.BUILD_ROOT }}\installer\release-notes.md
+            ${{ env.BUILD_ROOT }}\installer\RGui-AI-${{ steps.version.outputs.version }}-offline-setup.exe
+            ${{ env.BUILD_ROOT }}\installer\RGui-AI-${{ steps.version.outputs.version }}-offline-setup.exe.sha256
           if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
 
       - name: Upload build logs
         if: failure()
@@ -156,33 +126,67 @@ jobs:
           name: logs
           path: ${{ env.BUILD_ROOT }}\logs
           if-no-files-found: ignore
+          retention-days: 7
+
 
   release:
     needs: build
-    if: github.ref_type == 'tag'
-    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    environment: sourceforge
+    concurrency:
+      group: sourceforge-release
+      cancel-in-progress: false
     permissions:
       contents: write
+    env:
+      SOURCEFORGE_PROJECT: ${{ vars.SOURCEFORGE_PROJECT }}
+      SOURCEFORGE_USERNAME: ${{ vars.SOURCEFORGE_USERNAME }}
+      SOURCEFORGE_SSH_KEY: ${{ secrets.SOURCEFORGE_SSH_KEY }}
+      SOURCEFORGE_API_KEY: ${{ secrets.SOURCEFORGE_API_KEY }}
     steps:
-      - name: Download the installer
+      - name: Check out the release publisher
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download tested release files
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: installer
           path: dist
-
-      - name: Publish the release
+      - name: Write release notes
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          python3 - "$VERSION" <<'PY'
+          import hashlib, pathlib, sys
+          version = sys.argv[1]
+          file = pathlib.Path('dist/RGui-AI-' + version + '-offline-setup.exe')
+          with file.open('rb') as stream:
+              digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+          pathlib.Path('dist/release-notes.md').write_text(
+              'RGui AI for Windows x64.\n\n'
+              'The complete per-user installer includes the application, CPU runtime, '
+              'Qwen3.5-4B model, and picture reader. No model download is required after installation.\n\n'
+              'This build is unsigned.\n\nSHA-256: ' + digest + '\n', encoding='utf-8')
+          PY
+      - name: Publish the complete offline installer
+        uses: ./.github/actions/sourceforge
+        with:
+          artifact: dist/RGui-AI-${{ needs.build.outputs.version }}-offline-setup.exe
+          notes: dist/release-notes.md
+          version: ${{ needs.build.outputs.version }}
+      - name: Publish GitHub release notes and checksums
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
           VERSION: ${{ needs.build.outputs.version }}
-          PRERELEASE: ${{ needs.build.outputs.prerelease }}
         run: |
+          set -euo pipefail
           flags=()
-          if [ "$PRERELEASE" = "true" ]; then flags+=(--prerelease); fi
-          gh release create "$TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "RGui AI $VERSION" \
-            --notes-file dist/release-notes.md \
-            --verify-tag \
-            "${flags[@]}" \
-            dist/RGui-AI-*-setup.exe dist/RGui-AI-*-setup.exe.sha256
+          if [[ "$VERSION" == *-* ]]; then flags+=(--prerelease --latest=false); fi
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
+            --title "RGui AI $VERSION" --notes-file dist/release-notes-sourceforge.md \
+            "${flags[@]}" "dist/RGui-AI-$VERSION-offline-setup.exe.sha256"
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false "${flags[@]}"

@@ -31,8 +31,7 @@
                   -Gui drives the built Rgui.exe (shortcut, panel, buttons),
                   -Installer installs, upgrades and uninstalls the setup.exe
         package   assemble the pendrive layout in <BuildRoot>\dist
-        installer build RGui-AI-<version>-setup.exe (Inno Setup; the model
-                  is not inside, RGui downloads it on first use)
+        installer build a per-user setup EXE; -Offline includes both models
         deploy    copy dist to a pendrive (-Drive E:), keeping course notes
         clean     delete the build tree; downloads are kept
 
@@ -64,6 +63,8 @@ param(
 
     # fetch/package: leave the model out.
     [switch]$NoModel,
+    # installer/test -Installer: bundle the verified model and picture reader.
+    [switch]$Offline,
 
     # test: also start llama-server with the real model and ask it something.
     [switch]$Real,
@@ -101,17 +102,20 @@ $ProgressPreference = 'SilentlyContinue'
 
 $TclBundle   = 'tcltk-6768-6663.zip'
 $TclUrl      = "https://cran.r-project.org/bin/windows/Rtools/rtools45/files/$TclBundle"
-$ModelFile   = 'Qwen3.5-4B-Q4_K_M.gguf'
-$ModelUrl    = "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/$ModelFile"
-$ModelSha256 = '00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4'
-$ModelSize   = 2740937888
+$AssetSpec = Get-Content (Join-Path $PSScriptRoot 'release\assets.json') -Raw | ConvertFrom-Json
+. (Join-Path $PSScriptRoot 'release\offline.ps1')
+if ($Offline -and $NoModel) { throw '-Offline and -NoModel cannot be combined.' }
+$ModelFile   = $AssetSpec.assets[0].name
+$ModelUrl    = "https://huggingface.co/$($AssetSpec.repository)/resolve/$($AssetSpec.revision)/$($AssetSpec.assets[0].remote)"
+$ModelSha256 = $AssetSpec.assets[0].sha256
+$ModelSize   = [long]$AssetSpec.assets[0].bytes
 # The picture reader (multimodal projector) that goes with the model.
 # Saved under its own name: the upstream one, mmproj-F16.gguf, says
 # nothing about which model it belongs to.
-$VisionFile   = 'Qwen3.5-4B-mmproj-F16.gguf'
-$VisionUrl    = 'https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/mmproj-F16.gguf'
-$VisionSha256 = 'cd88edcf8d031894960bb0c9c5b9b7e1fea6ebee02b9f7ce925a00d12891f864'
-$VisionSize   = 672423616
+$VisionFile   = $AssetSpec.assets[1].name
+$VisionUrl    = "https://huggingface.co/$($AssetSpec.repository)/resolve/$($AssetSpec.revision)/$($AssetSpec.assets[1].remote)"
+$VisionSha256 = $AssetSpec.assets[1].sha256
+$VisionSize   = [long]$AssetSpec.assets[1].bytes
 $LlamaRepo   = 'ggml-org/llama.cpp'
 
 # Everything that ends up in the installer is checked against these.
@@ -781,12 +785,28 @@ function Invoke-Test {
 # check what a user would notice.  Leaves nothing behind: the last step is
 # the uninstaller.
 function Invoke-InstallerTests {
-    $setup = Get-ChildItem (Join-Path $BuildRoot 'installer') -Filter 'RGui-AI-*-setup.exe' -ErrorAction SilentlyContinue |
+    $pattern = if ($Offline) { 'RGui-AI-*-offline-setup.exe' } else { 'RGui-AI-*-setup.exe' }
+    $setup = Get-ChildItem (Join-Path $BuildRoot 'installer') -Filter $pattern -ErrorAction SilentlyContinue |
+             Where-Object { $Offline -or $_.Name -notlike '*-offline-setup.exe' } |
              Sort-Object LastWriteTime -Descending | Select-Object -First 1
     if (-not $setup) { Stop-WithError "no installer built yet; run '.\rgui installer' first." }
-    $app = Join-Path $BuildRoot 'itest\RGui AI'
-    $key = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{A1E92B8A-2AFD-45A8-BAF7-C1803C90FB17}_is1'
-    $lnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'RGui AI.lnk'
+    $identifier = [guid]::NewGuid().ToString('D')
+    $name = "RGui AI Test $identifier"
+    $fixture = Join-Path $BuildRoot ("installer-test-$identifier")
+    $app = Join-Path $fixture 'Application with spaces'
+    $key = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{$identifier}_is1"
+    $lnk = Join-Path ([Environment]::GetFolderPath('Programs')) ($name + '.lnk')
+    New-Item -ItemType Directory -Path $fixture -Force | Out-Null
+    $arguments = @('/DAppVersion=0.0.0-test','/DNumericVersion=0.0.0.0',"/DAppIdValue={{$identifier}",
+        "/DAppNameValue=$name","/DStageDir=$(Join-Path $BuildRoot 'stage')","/DOutputDir=$fixture")
+    if ($Offline) {
+        $arguments += Get-OfflineInstallerArguments -CacheDirectory $Cache -OutputDirectory $fixture -ModelDestination '{app}\R\ai\models'
+    }
+    $arguments += Join-Path $Repo 'packaging\rgui-ai.iss'
+    & (Find-InnoSetup) @arguments *> (Join-Path $fixture 'compile.log')
+    if ($LASTEXITCODE -ne 0) { throw "Isolated installer compilation failed. See $fixture\compile.log" }
+    $suffix = if ($Offline) { '-offline' } else { '' }
+    $setup = Get-Item (Join-Path $fixture "RGui-AI-0.0.0-test$suffix-setup.exe")
     $script:ItFail = 0
     function It([string]$What, [bool]$Ok, [string]$Detail = '') {
         Write-Host ("{0,-60} {1}" -f $What, $(if ($Ok) { 'ok' } else { 'FAIL' })) `
@@ -804,63 +824,80 @@ function Invoke-InstallerTests {
         Start-Sleep -Milliseconds 800
     }
 
-    Say "installer test: $($setup.Name) into '$app'"
-    Stop-Installed
-    if (Test-Path (Join-Path $app 'unins000.exe')) {
-        Start-Process -FilePath (Join-Path $app 'unins000.exe') -Wait -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES'
+    try {
+        Say "installer test: $($setup.Name) into '$app'"
+        Stop-Installed
+        if (Test-Path (Join-Path $app 'unins000.exe')) {
+            Start-Process -FilePath (Join-Path $app 'unins000.exe') -Wait -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES'
+        }
+
+        It 'silent install succeeds' ((Install-Setup) -eq 0)
+        foreach ($rel in 'Start-R.cmd', 'R\bin\x64\Rgui.exe', 'R\etc\Rai.conf', 'R\ai\system_prompt.txt',
+                         'R\ai\llama\llama-server.exe', 'R\ai\models', 'R\library\MASS', 'R\Tcl\bin') {
+            It ("installed: $rel") (Test-Path (Join-Path $app $rel))
+        }
+        if ($Offline) {
+            Assert-InstalledModels -Directory (Join-Path $app 'R\ai\models')
+            It 'both offline models match their size and SHA-256 pins' $true
+            & python (Join-Path $Repo 'release\smoke-model.py') --server (Join-Path $app 'R\ai\llama\llama-server.exe') --models (Join-Path $app 'R\ai\models') --log (Join-Path $fixture 'model-smoke.log')
+            if ($LASTEXITCODE -ne 0) { throw 'Installed model inference failed.' }
+        } else {
+            It 'slim installer excludes models' (@(Get-ChildItem (Join-Path $app 'R\ai\models') -Filter '*.gguf').Count -eq 0)
+        }
+        It 'no source tree or build scripts installed' `
+           (-not (Test-Path (Join-Path $app 'R\src')) -and -not (Test-Path (Join-Path $app 'R\rgui.ps1')))
+        It 'Start menu shortcut created' (Test-Path $lnk)
+        It 'per-user uninstall entry registered' (Test-Path $key)
+
+        # The launcher, from a path with a space: R used to die at start with
+        # "'R_TempDir' contains space" here.
+        Start-Process -FilePath (Join-Path $app 'Start-R.cmd') -WorkingDirectory $app -WindowStyle Minimized
+        $proc = $null
+        for ($i = 0; $i -lt 40 -and -not $proc; $i++) {
+            Start-Sleep -Milliseconds 500
+            $proc = Get-CimInstance Win32_Process -Filter "Name='Rgui.exe'" |
+                    Where-Object { $_.ExecutablePath -like "$app\*" } | Select-Object -First 1
+        }
+        It 'Start-R.cmd starts Rgui from the install folder' ($null -ne $proc)
+        Start-Sleep -Seconds 10
+        It 'Rgui is still running 10 s later (R started up)' `
+           ($proc -and [bool](Get-Process -Id $proc.ProcessId -ErrorAction SilentlyContinue))
+        Stop-Installed
+
+        # Upgrade: the files people edit must survive.
+        Add-Content -Path (Join-Path $app 'R\etc\Rai.conf') -Value '# my own setting'
+        Set-Content -Path (Join-Path $app 'R\ai\system_prompt.txt') -Value 'my custom prompt'
+        Set-Content -Path (Join-Path $app 'R\ai\context\05-anova.md') -Value '# my notes'
+        It 'reinstalling over it succeeds' ((Install-Setup) -eq 0)
+        It 'upgrade keeps an edited Rai.conf' ((Get-Content (Join-Path $app 'R\etc\Rai.conf') -Raw) -match 'my own setting')
+        It 'upgrade keeps an edited prompt' `
+           ((Get-Content (Join-Path $app 'R\ai\system_prompt.txt') -Raw).Trim() -eq 'my custom prompt')
+        It 'upgrade keeps course notes' (Test-Path (Join-Path $app 'R\ai\context\05-anova.md'))
+        if ($Offline) { Assert-InstalledModels -Directory (Join-Path $app 'R\ai\models') }
+
+        # Uninstall: the program and the downloaded model go, the work folder stays.
+        Set-Content -Path (Join-Path $app 'R\ai\models\stand-in.gguf') -Value 'model'
+        New-Item -ItemType Directory -Force -Path (Join-Path $app 'work') | Out-Null
+        Set-Content -Path (Join-Path $app 'work\my-analysis.R') -Value 'x <- 1'
+        $p = Start-Process -FilePath (Join-Path $app 'unins000.exe') -Wait -PassThru -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES'
+        Start-Sleep -Seconds 2
+        It 'silent uninstall succeeds' ($p.ExitCode -eq 0)
+        It 'program files removed' (-not (Test-Path (Join-Path $app 'R\bin\x64\Rgui.exe')))
+        It 'custom model preserved' (Test-Path (Join-Path $app 'R\ai\models\stand-in.gguf'))
+        It 'owned default model removed' (-not (Test-Path (Join-Path $app "R\ai\models\$ModelFile")))
+        It 'work folder kept' (Test-Path (Join-Path $app 'work\my-analysis.R'))
+        It 'Start menu shortcut removed' (-not (Test-Path $lnk))
+        It 'uninstall entry removed' (-not (Test-Path $key))
+
+        if ($script:ItFail -ne 0) { Stop-WithError "installer test ($script:ItFail failed checks)" }
+        Write-Host 'INSTALLER: PASSED' -ForegroundColor Green
+    } finally {
+        Stop-Installed
+        $uninstaller = Join-Path $app 'unins000.exe'
+        if (Test-Path -LiteralPath $uninstaller) {
+            Start-Process -FilePath $uninstaller -WindowStyle Hidden -Wait -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART'
+        }
     }
-
-    It 'silent install succeeds' ((Install-Setup) -eq 0)
-    foreach ($rel in 'Start-R.cmd', 'R\bin\x64\Rgui.exe', 'R\etc\Rai.conf', 'R\ai\system_prompt.txt',
-                     'R\ai\llama\llama-server.exe', 'R\ai\models', 'R\library\MASS', 'R\Tcl\bin') {
-        It ("installed: $rel") (Test-Path (Join-Path $app $rel))
-    }
-    It 'no model inside the installer' (@(Get-ChildItem (Join-Path $app 'R\ai\models') -Filter '*.gguf').Count -eq 0)
-    It 'no source tree or build scripts installed' `
-       (-not (Test-Path (Join-Path $app 'R\src')) -and -not (Test-Path (Join-Path $app 'R\rgui.ps1')))
-    It 'Start menu shortcut created' (Test-Path $lnk)
-    It 'per-user uninstall entry registered' (Test-Path $key)
-
-    # The launcher, from a path with a space: R used to die at start with
-    # "'R_TempDir' contains space" here.
-    Start-Process -FilePath (Join-Path $app 'Start-R.cmd') -WorkingDirectory $app -WindowStyle Minimized
-    $proc = $null
-    for ($i = 0; $i -lt 40 -and -not $proc; $i++) {
-        Start-Sleep -Milliseconds 500
-        $proc = Get-CimInstance Win32_Process -Filter "Name='Rgui.exe'" |
-                Where-Object { $_.ExecutablePath -like "$app\*" } | Select-Object -First 1
-    }
-    It 'Start-R.cmd starts Rgui from the install folder' ($null -ne $proc)
-    Start-Sleep -Seconds 10
-    It 'Rgui is still running 10 s later (R started up)' `
-       ($proc -and [bool](Get-Process -Id $proc.ProcessId -ErrorAction SilentlyContinue))
-    Stop-Installed
-
-    # Upgrade: the files people edit must survive.
-    Add-Content -Path (Join-Path $app 'R\etc\Rai.conf') -Value '# my own setting'
-    Set-Content -Path (Join-Path $app 'R\ai\system_prompt.txt') -Value 'my custom prompt'
-    Set-Content -Path (Join-Path $app 'R\ai\context\05-anova.md') -Value '# my notes'
-    It 'reinstalling over it succeeds' ((Install-Setup) -eq 0)
-    It 'upgrade keeps an edited Rai.conf' ((Get-Content (Join-Path $app 'R\etc\Rai.conf') -Raw) -match 'my own setting')
-    It 'upgrade keeps an edited prompt' `
-       ((Get-Content (Join-Path $app 'R\ai\system_prompt.txt') -Raw).Trim() -eq 'my custom prompt')
-    It 'upgrade keeps course notes' (Test-Path (Join-Path $app 'R\ai\context\05-anova.md'))
-
-    # Uninstall: the program and the downloaded model go, the work folder stays.
-    Set-Content -Path (Join-Path $app 'R\ai\models\stand-in.gguf') -Value 'model'
-    New-Item -ItemType Directory -Force -Path (Join-Path $app 'work') | Out-Null
-    Set-Content -Path (Join-Path $app 'work\my-analysis.R') -Value 'x <- 1'
-    $p = Start-Process -FilePath (Join-Path $app 'unins000.exe') -Wait -PassThru -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES'
-    Start-Sleep -Seconds 2
-    It 'silent uninstall succeeds' ($p.ExitCode -eq 0)
-    It 'program files removed' (-not (Test-Path (Join-Path $app 'R\bin\x64\Rgui.exe')))
-    It 'downloaded model removed' (-not (Test-Path (Join-Path $app 'R\ai\models\stand-in.gguf')))
-    It 'work folder kept' (Test-Path (Join-Path $app 'work\my-analysis.R'))
-    It 'Start menu shortcut removed' (-not (Test-Path $lnk))
-    It 'uninstall entry removed' (-not (Test-Path $key))
-
-    if ($script:ItFail -ne 0) { Stop-WithError "installer test ($script:ItFail failed checks)" }
-    Write-Host 'INSTALLER: PASSED' -ForegroundColor Green
 }
 
 # ---------------------------------------------------------------------
@@ -875,7 +912,7 @@ function Invoke-InstallerTests {
 function Copy-Runtime([string]$Root, [switch]$WithoutModel) {
     $dstR = Join-Path $Root 'R'
     New-Item -ItemType Directory -Force -Path $dstR | Out-Null
-    $xd = @('src', 'tests', 'tools', 'm4', 'po', 'packaging', '.github') |
+    $xd = @('src', 'tests', 'tools', 'm4', 'po', 'packaging', 'release', '.github') |
           ForEach-Object { Join-Path $Tree $_ }
     # build-only files at the top of the tree; the installer's imagedir
     # target leaves these out as well
@@ -941,14 +978,21 @@ function Invoke-Installer {
     $script:LastLog = $log
     Say ("compiling the installer, version {0}" -f $ver.Text)
     $iss = Join-Path $Repo 'packaging\rgui-ai.iss'
-    $p = Start-Process -FilePath $iscc -Wait -PassThru -NoNewWindow `
-        -RedirectStandardOutput $log -RedirectStandardError "$log.err" -ArgumentList @(
+    $offlineArguments = @()
+    if ($Offline) {
+        $offlineArguments = @(Get-OfflineInstallerArguments -CacheDirectory $Cache -OutputDirectory (Join-Path $BuildRoot 'offline') -ModelDestination '{app}\R\ai\models')
+    }
+    $arguments = @(
             ('"/DAppVersion={0}"' -f $ver.Text), ('"/DNumericVersion={0}"' -f $ver.Numeric),
-            ('"/DStageDir={0}"' -f $stage), ('"/DOutputDir={0}"' -f $outDir), ('"{0}"' -f $iss))
+            ('"/DStageDir={0}"' -f $stage), ('"/DOutputDir={0}"' -f $outDir)) + @($offlineArguments | ForEach-Object { '"{0}"' -f $_ }) + @(('"{0}"' -f $iss))
+    $p = Start-Process -FilePath $iscc -Wait -PassThru -NoNewWindow `
+        -RedirectStandardOutput $log -RedirectStandardError "$log.err" -ArgumentList $arguments
     if (Test-Path "$log.err") { Get-Content "$log.err" | Add-Content $log; Remove-Item "$log.err" }
     if ($p.ExitCode -ne 0) { Stop-WithError "Inno Setup compiler (exit code $($p.ExitCode))" }
-    $exe = Join-Path $outDir ('RGui-AI-{0}-setup.exe' -f $ver.Text)
+    $suffix = if ($Offline) { '-offline' } else { '' }
+    $exe = Join-Path $outDir ('RGui-AI-{0}{1}-setup.exe' -f $ver.Text,$suffix)
     if (-not (Test-Path $exe)) { Stop-WithError "the compiler reported success but $exe is missing" }
+    Assert-InstallerSize -Path $exe
     $script:InstallerExe = $exe
     $sha = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant()
     # One LF-terminated line, as sha256sum writes it: with CRLF, 'sha256sum -c'

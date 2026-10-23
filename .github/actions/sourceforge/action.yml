@@ -1,0 +1,41 @@
+name: Publish offline installer to SourceForge
+description: Verify, publish, promote, and retain the latest installer per release channel.
+inputs:
+  artifact:
+    description: Local installer EXE with an adjacent .sha256 file
+    required: true
+  notes:
+    description: Local release notes file
+    required: true
+  version:
+    description: Validated fork version without the v prefix
+    required: true
+outputs:
+  download_url:
+    description: Verified version-specific installer URL
+    value: ${{ steps.publish.outputs.download_url }}
+runs:
+  using: composite
+  steps:
+    - name: Check publishing prerequisites
+      shell: bash
+      run: |
+        set -euo pipefail
+        command -v rsync >/dev/null
+        command -v sftp >/dev/null
+        command -v ssh-keyscan >/dev/null
+        python3 release/sourceforge.py --check-config
+    - name: Publish and verify the installer
+      id: publish
+      shell: bash
+      env:
+        RELEASE_ARTIFACT: ${{ inputs.artifact }}
+        RELEASE_NOTES: ${{ inputs.notes }}
+        RELEASE_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        source_commit=$(git rev-parse HEAD)
+        python3 release/sourceforge.py \
+          --artifact "$RELEASE_ARTIFACT" --notes "$RELEASE_NOTES" \
+          --version "$RELEASE_VERSION" --source "$source_commit" \
+          --github-output "$GITHUB_OUTPUT"

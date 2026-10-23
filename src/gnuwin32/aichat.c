@@ -326,7 +326,7 @@ static void ai_defaults(void)
     ai_resolve("ai/llama/llama-server.exe", CFG.server_exe, MAX_PATH);
     ai_resolve("ai/models/Qwen3.5-4B-Q4_K_M.gguf", CFG.model, MAX_PATH);
     snprintf(CFG.model_url, sizeof CFG.model_url, "%s",
-	     "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/"
+	     "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/e87f176479d0855a907a41277aca2f8ee7a09523/"
 	     "Qwen3.5-4B-Q4_K_M.gguf");
     snprintf(CFG.model_sha256, sizeof CFG.model_sha256, "%s",
 	     "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4");
@@ -336,7 +336,7 @@ static void ai_defaults(void)
     CFG.image_max_tokens = 256;
     ai_resolve("ai/models/Qwen3.5-4B-mmproj-F16.gguf", CFG.vision_model, MAX_PATH);
     snprintf(CFG.vision_url, sizeof CFG.vision_url, "%s",
-	     "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/"
+	     "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/e87f176479d0855a907a41277aca2f8ee7a09523/"
 	     "mmproj-F16.gguf");
     snprintf(CFG.vision_sha256, sizeof CFG.vision_sha256, "%s",
 	     "cd88edcf8d031894960bb0c9c5b9b7e1fea6ebee02b9f7ce925a00d12891f864");

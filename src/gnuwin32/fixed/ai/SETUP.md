@@ -49,7 +49,7 @@ rgui full             build R, base and recommended packages
 rgui test -Real -Gui  every test there is, see below
 rgui package          assemble the stick layout in D:\rgui-build\dist
 rgui deploy -Drive E: copy it onto the stick
-rgui installer        build RGui-AI-<version>-setup.exe (no model inside)
+rgui installer -Offline build RGui-AI-<version>-offline-setup.exe with both models
 ```
 
 The build happens in `D:\rgui-build\tree`, not in the repository:
@@ -80,7 +80,7 @@ say), use `rgui full` instead; it is incremental too.
 | `rgui test` | `aichat.c` compiles warning-free with the production flags; JSON, SSE, chunked HTTP, the `<think>` filter, Stop and a missing server behave; captured real `llama-server` output parses correctly; on real RichEdit controls, Markdown renders without its markup, emoji and characters Consolas lacks get fonts that have them, typed or set text in any script arrives whole; while an answer streams, a transcript scrolled up stays where it is, a selection is kept, and nothing is written while the mouse button is down in it; pictures are scaled and encoded (JPEG for photos), go into the request before the question, stay for follow-ups up to 4 per request and are left out without the picture reader; the model and the picture reader download in one go, or the reader alone; in the transcript (msftedit's RichEdit) a sent picture shows as a thumbnail that a click opens; the strip of attached pictures opens one on a click and removes one with its x | ~10 s |
 | `rgui test -Real` | `aichat.c` starts the real `llama-server` itself (with the picture reader), the model loads, answers with a fenced code block, reads the number in a picture, and the server is stopped again | ~1 min |
 | `rgui test -Gui` | drives the built `Rgui.exe` through window messages: keyboard shortcut, panel, all buttons, hide/show/close, Copy code, To editor, R running console code **while** the model answers, the first-run download offer and the download itself, a missing model failing politely, the panel's full menu bar and menu-independent Ctrl+T, the Attach menu, answers without code (reported, clipboard untouched), To editor into an already open script, a question in Hungarian, Greek, Chinese and emoji reaching the transcript unchanged, answers shown without their Markdown code fences, Attach > Current plot sending the plot itself even with the panel covering it (checked by its colours, as the fake server received it), a click on an attached thumbnail opening it, a follow-up still carrying the picture, a screenshot pasted from the clipboard, its x and Remove pictures, the real model recognising a boxplot, and `llama-server` dying with Rgui | ~3–4 min |
-| `rgui test -Installer` | installs the last built setup.exe into a folder whose name has a space in it, starts RGui from the Start-menu launcher, upgrades over it (your `Rai.conf`, prompt and notes must survive) and uninstalls it (the program and model go, your `work` folder stays) | ~1 min |
+| `rgui test -Installer -Offline` | compiles a separate installer identity, installs into a folder containing spaces, verifies model hashes and local text/picture inference, starts RGui, checks upgrade preservation, and uninstalls while retaining work and custom models | several minutes |
 
 When something fails, the script prints the first error lines of the
 build log (usually the cause) and the log's path.
@@ -124,7 +124,8 @@ Check the server once with `R\ai\llama\llama-server.exe --version`.
 
 ## 4. Releases
 
-Pushing a version tag builds and publishes the installer on GitHub:
+Complete the [SourceForge setup](../../../../release/SOURCEFORGE.md) first.
+The owner then pushes a unique version tag to build and publish the installer:
 
 ```
 git tag v0.1.1
@@ -133,15 +134,18 @@ git push origin v0.1.1
 
 `.github/workflows/release.yml` then installs Rtools45 and Inno Setup
 (both pinned to a version and a SHA-256), runs `rgui fetch`, `full`,
-`test`, `installer` and `test -Installer` on a Windows runner, and
-publishes `RGui-AI-0.1.1-setup.exe` with its checksum as the release
-"RGui AI 0.1.1". A tag with a suffix such as `v0.2.0-rc1` becomes a
+`test`, `installer -Offline` and `test -Installer -Offline` on a Windows runner.
+A Linux job uploads `RGui-AI-0.1.1-offline-setup.exe` to SourceForge, verifies
+its public mirror copy, selects the stable default, and removes superseded
+files in that release channel. GitHub's "RGui AI 0.1.1" release contains
+download links and the checksum. A tag such as `v0.2.0-rc.1` becomes a
 pre-release. A tag that does not look like `v1.2.3` is rejected before
 anything is built. **Actions > release > Run workflow** builds and tests
 without publishing; the installer is then an artifact of the run.
 
-The GUI tests do not run there: they need a desktop session. Run
-`rgui test -Real -Gui` here before tagging.
+The full assistant GUI suite remains a local desktop check. Hosted installer
+checks include a small real-model text/picture smoke test. Run
+`rgui test -Real -Gui` locally before tagging.
 
 To rehearse the whole workflow first, without pushing anything:
 
@@ -159,10 +163,10 @@ time; *More info > Run anyway*.
 
 ## 5. The model
 
-It is not in the installer: at 2.7 GB it would exceed GitHub's 2 GB
-limit for release files, and it would make every update 2.7 GB. The
-first time the assistant is opened without it, RGui asks whether to
-download it, together with its picture reader (3.4 GB in all). An
+The complete SourceForge offline installer includes both the model and picture
+reader. It needs no model download after installation. The optional slim
+installer omits them. When the assistant opens without them, RGui offers to
+download both files (3.4 GB in all). An
 install that already has the model is offered the picture reader alone
 (0.7 GB) the next time the panel opens; saying no keeps the assistant
 text-only and asks again when a picture is attached. The download runs in the background (R stays usable, the

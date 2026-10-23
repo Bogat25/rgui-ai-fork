@@ -37,8 +37,8 @@ Pass the same `-BuildRoot` and optional `-Rtools` to each command. Real and GUI
 tests require their model/runtime/build prerequisites. GUI tests manipulate real
 windows and the clipboard; use a disposable desktop with synthetic input and
 leave the test windows alone. Installer tests change local registration: review
-the harness and use a disposable profile without an existing RGui AI installation.
-Unlike the other two forks, this installer harness uses the production AppId.
+the harness and use a disposable desktop. The installer harness compiles a
+separate application identity and never replaces an existing RGui installation.
 
 The [test harness guide](../src/gnuwin32/aitests/README.md) describes fake-server
 fixtures, captured streaming output, and the standalone native executable.
@@ -48,12 +48,13 @@ Logs and generated fixtures belong under BuildRoot, not Git.
 
 ```powershell
 .\rgui.cmd package -BuildRoot C:\rgui-build
-.\rgui.cmd installer -Version 0.1.0 -BuildRoot C:\rgui-build
+.\rgui.cmd installer -Offline -Version 0.1.0 -BuildRoot C:\rgui-build
 ```
 
 `package` assembles the portable `dist` layout. `-NoModel` omits downloaded
 weights. `installer` creates `installer/RGui-AI-<version>-setup.exe` and its
-`.sha256`; it always excludes models. Build current sources before packaging:
+`.sha256`. Add `-Offline` to include both verified models in an
+`-offline-setup.exe`. Slim installers omit the models. Build current sources before packaging:
 the RGui installer command stages an existing build rather than compiling it.
 `deploy -Drive E:` copies the distribution to removable storage; review its
 destination and preservation behavior in the detailed setup guide before use.
@@ -70,8 +71,9 @@ an installer version `0.1.0` does not mean R itself is version 0.1.0.
 [release.yml](../.github/workflows/release.yml) handles version-tag pushes and
 manual dispatch. A tag such as `v0.1.0` builds the tagged commit, fetches pinned
 tools, builds R, runs default checks, packages the installer, and checks its
-installation lifecycle. A separate job publishes the EXE and checksum as a
-GitHub release. A suffix such as `-rc1` marks a prerelease. Manual dispatch builds
+installation lifecycle. Hosted builds use `-Offline`; a separate job publishes
+the complete installer on SourceForge and GitHub release notes with its download
+link and checksum. See [SourceForge setup](../release/SOURCEFORGE.md). A suffix such as `-rc1` marks a prerelease. Manual dispatch builds
 Actions artifacts without publishing.
 
 Before the owner publishes a tag:
@@ -83,8 +85,9 @@ Before the owner publishes a tag:
 
 Creating a local tag alone does not trigger GitHub. Retrying an old run uses the
 old tagged source. Use a new tag for a corrected source revision; do not silently
-move a published release tag. GUI/real-model checks require a local desktop and
-are not included in the hosted default suite.
+move a published release tag. The full assistant GUI suite requires a local
+desktop and remains opt-in. Hosted offline installer checks include a small
+real-model text/picture smoke test.
 
 The optional [CI dry-run tool](../packaging/ci-dryrun.py) rehearses the build job
 from a clean copy of the committed source. Publishing, signing, and hosted
